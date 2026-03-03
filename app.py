@@ -19,7 +19,7 @@ def init_db():
 
 conn = init_db()
 
-# Commissions data (Updated based on 2025 PDF and market research)
+# Commissions data (Updated based on 2025 PDF)
 COMMISSIONS = {
     "Автотовары": 0.205,
     "Аксессуары для авто": 0.205,
@@ -58,13 +58,11 @@ def get_ai_category(product_name):
     category = "Others"
     name_lower = str(product_name).lower()
     
-    # Simple rule-based matching
     for cat in COMMISSIONS.keys():
         if cat.lower() in name_lower:
             category = cat
             break
             
-    # AI Classification if enabled
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key and category == "Others":
         try:
@@ -77,8 +75,8 @@ def get_ai_category(product_name):
             ai_cat = response.choices[0].message.content.strip()
             if ai_cat in COMMISSIONS:
                 category = ai_cat
-        except Exception as e:
-            st.sidebar.error(f"AI Error: {e}")
+        except:
+            pass
 
     c.execute("INSERT OR REPLACE INTO ai_cache VALUES (?, ?)", (product_name, category))
     conn.commit()
@@ -172,7 +170,9 @@ if uploaded_file:
         csv = res_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 Скачать результат", csv, "analysis.csv", "text/csv")
     else:
-        st.warning("Не удалось обработать данные. Проверьте формат файла.")
+        st.warning("Не удалось обработать данные. В файле нет строк или формат неверный.")
+        st.write("Колонки в файле:", df.columns.tolist())
+        st.write("Первые строки:", df.head())
 else:
     st.info("Скачайте шаблон в боковой панели, заполните его и загрузите обратно.")
     st.markdown("### 📝 Структура файла")
