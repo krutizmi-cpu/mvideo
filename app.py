@@ -61,8 +61,7 @@ def get_ai_category(name: str, categories: list, conn, client_key: str) -> str:
     
     try:
         client = OpenAI(api_key=api_key)
-        cats_str = "
-".join(f"- {cat}" for cat in categories)
+        cats_str = \n".join(f"- {cat}" for cat in categories)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
