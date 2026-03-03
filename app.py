@@ -3,27 +3,23 @@ import sqlite3
 import pandas as pd
 import json
 import os
+import io
 from openai import OpenAI
 
 # Page config
 st.set_page_config(page_title="M.Video Economics", layout="wide")
 
-# Database initialization
+# Database
 def init_db():
     conn = sqlite3.connect('mvideo.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ai_cache (
-            name TEXT PRIMARY KEY,
-            category TEXT
-        )
-    """)
+    c.execute("CREATE TABLE IF NOT EXISTS ai_cache (name TEXT PRIMARY KEY, category TEXT)")
     conn.commit()
     return conn
 
 conn = init_db()
 
-# Commissions data
+# Commissions
 COMMISSIONS = {
     "Автотовары": 0.10, "Аксессуары для авто": 0.12, "Аудио-Видео": 0.08, "Бытовая химия": 0.05,
     "Детские товары": 0.07, "Игрушки": 0.09, "Инструменты": 0.11, "Климатическая техника": 0.08,
@@ -41,33 +37,16 @@ def get_ai_category(product_name):
     c.execute("SELECT category FROM ai_cache WHERE name=?", (product_name,))
     cached = c.fetchone()
     if cached: return cached[0]
-    
     category = "Others"
     name_lower = product_name.lower()
     for cat in COMMISSIONS.keys():
         if cat.lower() in name_lower:
             category = cat
             break
-            
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        try:
-            client = OpenAI(api_key=api_key)
-            cats_str = ", ".join(COMMISSIONS.keys())
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "system", "content": f"Determine category from: {cats_str}"},
-                          {"role": "user", "content": product_name}]
-            )
-            ai_cat = response.choices[0].message.content.strip()
-            if ai_cat in COMMISSIONS: category = ai_cat
-        except: pass
-            
     c.execute("INSERT OR REPLACE INTO ai_cache VALUES (?, ?)", (product_name, category))
     conn.commit()
     return category
 
-# Title
 st.markdown('<p style="font-size: 32px; font-weight: bold; color: #E31235;">📈 Расчет Юнит-Экономики М.Видео</p>', unsafe_allow_html=True)
 
 with st.sidebar:
@@ -79,7 +58,24 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("📁 Массовая загрузка")
-    uploaded_file = st.file_uploader("Выберите Excel файл", type=["xlsx"])
+    
+    # Template Download
+    template_df = pd.DataFrame(columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"])
+    template_df.loc[0] = ["SKU-001", "Пример товара", 10, 10, 10, 0.5, 2990, 1500]
+    
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        template_df.to_excel(writer, index=False)
+    
+    st.download_button(
+        label="📥 Скачать шаблон Excel",
+        data=buffer.getvalue(),
+        file_name="mvideo_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+    
+    uploaded_file = st.file_uploader("Загрузите заполненный файл", type=["xlsx"])
 
 def calculate_logistics(l, w, h, weight):
     vol_weight = (l * w * h) / 5000
@@ -88,7 +84,6 @@ def calculate_logistics(l, w, h, weight):
 
 def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
     tax_rate = 0.06 if tax_type == "УСН Доходы (6%)" else 0.04 if tax_type == "Самозанятый (4%)" else 0.20
-    # For Income-Expenses simplified as fixed rate on price for this formula
     m_decimal = target_m / 100
     denom = 1 - m_decimal - commission_rate - (acq_rate/100) - (early_rate/100) - tax_rate
     if denom <= 0: return 0
@@ -98,7 +93,7 @@ if uploaded_file:
     df = pd.read_excel(uploaded_file)
     results = []
     
-    with st.status("🔍 Анализируем товары...") as status:
+    with st.status("🔍 Обработка...") as status:
         for _, row in df.iterrows():
             try:
                 name, sku = str(row['наименование']), str(row['артикул'])
@@ -109,22 +104,22 @@ if uploaded_file:
                 comm_rate = COMMISSIONS.get(category, 0.10)
                 logistics = calculate_logistics(l, w, h, weight)
                 
-                # Current metrics
+                # Current
                 ref_fee = price * comm_rate
                 acq_cost = price * (acquiring/100)
                 early_cost = price * (early_payout/100)
-                tax_cost = price * 0.06 if tax_system == "УСН Доходы (6%)" else 0 # Simplified
+                tax_cost = price * 0.06 if tax_system == "УСН Доходы (6%)" else 0
                 
                 profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
                 margin = (profit / price) * 100 if price > 0 else 0
                 
-                # Target calculation
+                # Target
                 rec_price = find_target_price(cost, logistics, comm_rate, acquiring, early_payout, tax_system, target_margin)
                 
                 results.append({
                     "Артикул": sku, "Наименование": name, "Категория": category,
                     "Тек. Цена": price, "Маржа %": round(margin, 2),
-                    "Прибыль": round(profit, 2), "Целевая Маржа %": target_margin,
+                    "Прибыль": round(profit, 2), "Цель Маржа %": target_margin,
                     "Рек. Цена": round(rec_price, 0)
                 })
             except Exception as e:
@@ -132,12 +127,11 @@ if uploaded_file:
         status.update(label="✅ Готово!", state="complete")
 
     res_df = pd.DataFrame(results)
-    st.subheader("📋 Результаты")
     st.dataframe(res_df.style.background_gradient(subset=['Маржа %'], cmap='RdYlGn'), use_container_width=True)
     
     csv = res_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 Скачать CSV", csv, "mvideo_analysis.csv", "text/csv")
+    st.download_button("📥 Скачать результат", csv, "analysis.csv", "text/csv")
 else:
-    st.info("Загрузите Excel файл.")
-    st.markdown("### 📝 Пример структуры")
-    st.table(pd.DataFrame([{"артикул": "SKU-1", "наименование": "Товар", "д": 10, "ш": 10, "в": 10, "вес": 0.5, "цена": 1000, "себестоимость": 500}]))
+    st.info("Скачайте шаблон в боковой панели, заполните его и загрузите обратно.")
+    st.markdown("### 📝 Структура файла")
+    st.table(template_df)
