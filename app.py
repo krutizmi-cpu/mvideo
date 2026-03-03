@@ -1,24 +1,4 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
-from openai import OpenAI
 
-# Configuration
-st.set_page_config(
-    page_title="M.Видео — Юнит-экономика FBS",
-    layout="wide",
-    page_icon="📦"
-)
-
-DB_PATH = "products_storage.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku TEXT UNIQUE,
             name TEXT,
             length_cm REAL,
             width_cm REAL,
