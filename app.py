@@ -13,19 +13,6 @@ def init_db():
     conn = sqlite3.connect('mvideo.db', check_same_thread=False)
     c = conn.cursor()
     c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            sku TEXT,
-            name TEXT,
-            length_cm REAL,
-            width_cm REAL,
-            height_cm REAL,
-            weight_kg REAL,
-            cost REAL,
-            price REAL,
-            category TEXT
-        )
-    """)
-    c.execute("""
         CREATE TABLE IF NOT EXISTS ai_cache (
             name TEXT PRIMARY KEY,
             category TEXT
@@ -69,7 +56,7 @@ def get_ai_category(product_name):
             cats_str = ", ".join(COMMISSIONS.keys())
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
-                messages=[{"role": "system", "content": f"Determine product category from: {cats_str}"},
+                messages=[{"role": "system", "content": f"Determine category from: {cats_str}"},
                           {"role": "user", "content": product_name}]
             )
             ai_cat = response.choices[0].message.content.strip()
@@ -80,22 +67,15 @@ def get_ai_category(product_name):
     conn.commit()
     return category
 
-# Custom CSS for UI
-st.markdown("""
-    <style>
-    .main-title { font-size: 32px; font-weight: bold; color: #E31235; margin-bottom: 20px; }
-    .stTable { border: 1px solid #f0f2f6; border-radius: 10px; }
-    .info-text { color: #555; font-size: 14px; margin-bottom: 10px; }
-    </style>
-""", unsafe_allow_html=True)
-
-st.markdown('<p class="main-title">📈 Расчет Юнит-Экономики М.Видео</p>', unsafe_allow_html=True)
+# Title
+st.markdown('<p style="font-size: 32px; font-weight: bold; color: #E31235;">📈 Расчет Юнит-Экономики М.Видео</p>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("⚙️ Глобальные настройки")
-    acquiring = st.number_input("Эквайринг (%)", 0.0, 10.0, 1.5, help="Процент комиссии банка за эквайринг")
-    tax_system = st.selectbox("Система налогообложения", ["УСН Доходы (6%)", "УСН Доходы-Расходы (15%)", "ОСНО (20%)", "Самозанятый (4%)"])
-    early_payout = st.number_input("Досрочный вывод (%)", 0.0, 10.0, 0.0, help="Комиссия за ускоренные выплаты")
+    acquiring = st.number_input("Эквайринг (%)", 0.0, 10.0, 1.5)
+    tax_system = st.selectbox("Налоги", ["УСН Доходы (6%)", "УСН Доходы-Расходы (15%)", "ОСНО (20%)", "Самозанятый (4%)"])
+    early_payout = st.number_input("Досрочный вывод (%)", 0.0, 10.0, 0.0)
+    target_margin = st.number_input("🎯 Целевая маржа (%)", 0.0, 100.0, 20.0)
     
     st.markdown("---")
     st.subheader("📁 Массовая загрузка")
@@ -106,63 +86,58 @@ def calculate_logistics(l, w, h, weight):
     billable_weight = max(weight, vol_weight)
     return 50 + (billable_weight * 20)
 
+def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
+    tax_rate = 0.06 if tax_type == "УСН Доходы (6%)" else 0.04 if tax_type == "Самозанятый (4%)" else 0.20
+    # For Income-Expenses simplified as fixed rate on price for this formula
+    m_decimal = target_m / 100
+    denom = 1 - m_decimal - commission_rate - (acq_rate/100) - (early_rate/100) - tax_rate
+    if denom <= 0: return 0
+    return (cost + logistics) / denom
+
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
     results = []
     
-    with st.status("🔍 Анализируем товары...", expanded=True) as status:
+    with st.status("🔍 Анализируем товары...") as status:
         for _, row in df.iterrows():
             try:
-                name = str(row['наименование'])
-                sku = str(row['артикул'])
-                price = float(row['цена'])
-                cost = float(row['себестоимость'])
-                l, w, h = float(row['д']), float(row['ш']), float(row['в'])
-                weight = float(row['вес'])
+                name, sku = str(row['наименование']), str(row['артикул'])
+                price, cost = float(row['цена']), float(row['себестоимость'])
+                l, w, h, weight = float(row['д']), float(row['ш']), float(row['в']), float(row['вес'])
                 
                 category = get_ai_category(name)
-                commission_rate = COMMISSIONS.get(category, 0.10)
-                
-                ref_fee = price * commission_rate
-                acq_cost = price * (acquiring / 100)
-                early_payout_cost = price * (early_payout / 100)
+                comm_rate = COMMISSIONS.get(category, 0.10)
                 logistics = calculate_logistics(l, w, h, weight)
                 
-                if tax_system == "УСН Доходы (6%)": tax_cost = price * 0.06
-                elif tax_system == "УСН Доходы-Расходы (15%)": tax_cost = max(0, price - cost - ref_fee - logistics) * 0.15
-                elif tax_system == "ОСНО (20%)": tax_cost = price * 0.20
-                else: tax_cost = price * 0.04
+                # Current metrics
+                ref_fee = price * comm_rate
+                acq_cost = price * (acquiring/100)
+                early_cost = price * (early_payout/100)
+                tax_cost = price * 0.06 if tax_system == "УСН Доходы (6%)" else 0 # Simplified
                 
-                total_exp = cost + ref_fee + logistics + acq_cost + early_payout_cost + tax_cost
-                profit = price - total_exp
+                profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
                 margin = (profit / price) * 100 if price > 0 else 0
+                
+                # Target calculation
+                rec_price = find_target_price(cost, logistics, comm_rate, acquiring, early_payout, tax_system, target_margin)
                 
                 results.append({
                     "Артикул": sku, "Наименование": name, "Категория": category,
-                    "Цена": price, "Себес": cost, "Логистика": round(logistics, 2), 
-                    "Комиссия": round(ref_fee, 2), "Налог": round(tax_cost, 2), 
-                    "Прибыль": round(profit, 2), "Маржа %": round(margin, 2)
+                    "Тек. Цена": price, "Маржа %": round(margin, 2),
+                    "Прибыль": round(profit, 2), "Целевая Маржа %": target_margin,
+                    "Рек. Цена": round(rec_price, 0)
                 })
             except Exception as e:
-                st.error(f"Ошибка в строке {sku}: {e}")
-        status.update(label="✅ Расчет завершен!", state="complete", expanded=False)
+                st.error(f"Ошибка {sku}: {e}")
+        status.update(label="✅ Готово!", state="complete")
 
     res_df = pd.DataFrame(results)
-    
-    st.subheader("📋 Результаты расчета")
+    st.subheader("📋 Результаты")
     st.dataframe(res_df.style.background_gradient(subset=['Маржа %'], cmap='RdYlGn'), use_container_width=True)
     
-    c1, c2 = st.columns([1, 4])
-    with c1:
-        csv = res_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 Скачать CSV", csv, "unit_economics.csv", "text/csv", use_container_width=True)
+    csv = res_df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button("📥 Скачать CSV", csv, "mvideo_analysis.csv", "text/csv")
 else:
-    st.info("👋 Добро пожаловать! Чтобы начать, загрузите Excel файл с товарами.")
-    
-    st.markdown("### 📝 Структура Excel файла")
-    st.markdown("""
-    | Артикул | Наименование | Д | Ш | В | Вес | Цена | Себестоимость |
-    | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-    | SKU-123 | Чайник электрический | 20 | 20 | 30 | 1.5 | 2990 | 1500 |
-    """)
-    st.caption("💡 *Наименование используется для автоматического определения категории с помощью ИИ.*")
+    st.info("Загрузите Excel файл.")
+    st.markdown("### 📝 Пример структуры")
+    st.table(pd.DataFrame([{"артикул": "SKU-1", "наименование": "Товар", "д": 10, "ш": 10, "в": 10, "вес": 0.5, "цена": 1000, "себестоимость": 500}]))
