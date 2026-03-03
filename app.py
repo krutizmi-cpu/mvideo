@@ -9,7 +9,7 @@ from openai import OpenAI
 # Page config
 st.set_page_config(page_title="M.Video Economics", layout="wide")
 
-# Database
+# Database initialization
 def init_db():
     conn = sqlite3.connect('mvideo.db', check_same_thread=False)
     c = conn.cursor()
@@ -19,17 +19,34 @@ def init_db():
 
 conn = init_db()
 
-# Commissions
+# Commissions data (Updated based on 2025 PDF and market research)
 COMMISSIONS = {
-    "Автотовары": 0.10, "Аксессуары для авто": 0.12, "Аудио-Видео": 0.08, "Бытовая химия": 0.05,
-    "Детские товары": 0.07, "Игрушки": 0.09, "Инструменты": 0.11, "Климатическая техника": 0.08,
-    "Компьютерная техника": 0.06, "Красота и здоровье": 0.09, "Кухонная техника": 0.08, "Мебель": 0.12,
-    "Освещение": 0.10, "Офисная техника": 0.07, "Планшеты": 0.05, "Посуда": 0.10, "Продукты питания": 0.05,
-    "Сад и огород": 0.11, "Сантехника": 0.10, "Смартфоны": 0.04, "Спорт и отдых": 0.09,
-    "Строительство и ремонт": 0.11, "ТВ и цифровое видео": 0.07, "Текстиль": 0.10, "Товары для дома": 0.09,
-    "Товары для животных": 0.07, "Умный дом": 0.08, "Фото и видео": 0.07, "Хобби и творчество": 0.09,
-    "Цифровое фото и видео": 0.07, "Электроника": 0.08, "Электросамокаты": 0.08, "Apple": 0.03,
-    "Gaming": 0.09, "Laptops": 0.06, "PC Components": 0.07, "Peripherals": 0.10, "Stationery": 0.12, "Others": 0.10
+    "Автотовары": 0.205,
+    "Аксессуары для авто": 0.205,
+    "Смартфоны": 0.07,
+    "Смартфоны и связь": 0.07,
+    "Ноутбуки": 0.07,
+    "Планшеты": 0.07,
+    "Компьютеры и комплектующие": 0.08,
+    "Телевизоры": 0.09,
+    "Аудио-Видео": 0.10,
+    "Аудиотехника": 0.10,
+    "Фото и видео": 0.11,
+    "Фото и видеотехника": 0.11,
+    "Крупная бытовая техника": 0.13,
+    "Бытовая техника": 0.14,
+    "Мебель": 0.17,
+    "Посуда": 0.20,
+    "Товары для кухни": 0.18,
+    "Текстиль для дома": 0.19,
+    "Товары для ванной": 0.18,
+    "Книги": 0.24,
+    "Канцелярские товары": 0.22,
+    "Одежда": 0.20,
+    "Обувь": 0.21,
+    "Аксессуары": 0.19,
+    "Красота и здоровье": 0.20,
+    "Others": 0.15
 }
 
 def get_ai_category(product_name):
@@ -37,12 +54,32 @@ def get_ai_category(product_name):
     c.execute("SELECT category FROM ai_cache WHERE name=?", (product_name,))
     cached = c.fetchone()
     if cached: return cached[0]
+    
     category = "Others"
-    name_lower = product_name.lower()
+    name_lower = str(product_name).lower()
+    
+    # Simple rule-based matching
     for cat in COMMISSIONS.keys():
         if cat.lower() in name_lower:
             category = cat
             break
+            
+    # AI Classification if enabled
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key and category == "Others":
+        try:
+            client = OpenAI(api_key=api_key)
+            prompt = f"Определи категорию товара '{product_name}' из списка: {', '.join(COMMISSIONS.keys())}. Ответь только названием категории."
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            ai_cat = response.choices[0].message.content.strip()
+            if ai_cat in COMMISSIONS:
+                category = ai_cat
+        except Exception as e:
+            st.sidebar.error(f"AI Error: {e}")
+
     c.execute("INSERT OR REPLACE INTO ai_cache VALUES (?, ?)", (product_name, category))
     conn.commit()
     return category
@@ -59,7 +96,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📁 Массовая загрузка")
     
-    # Template Download
     template_df = pd.DataFrame(columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"])
     template_df.loc[0] = ["SKU-001", "Пример товара", 10, 10, 10, 0.5, 2990, 1500]
     
@@ -91,20 +127,25 @@ def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, ta
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
+    df.columns = [str(c).strip().lower() for c in df.columns]
     results = []
     
     with st.status("🔍 Обработка...") as status:
-        for _, row in df.iterrows():
+        for index, row in df.iterrows():
             try:
-                name, sku = str(row['наименование']), str(row['артикул'])
-                price, cost = float(row['цена']), float(row['себестоимость'])
-                l, w, h, weight = float(row['д']), float(row['ш']), float(row['в']), float(row['вес'])
+                name = str(row.get('наименование', 'Неизвестно'))
+                sku = str(row.get('артикул', f'Row-{index}'))
+                price = float(row.get('цена', 0))
+                cost = float(row.get('себестоимость', 0))
+                l = float(row.get('д', 0))
+                w = float(row.get('ш', 0))
+                h = float(row.get('в', 0))
+                weight = float(row.get('вес', 0))
                 
                 category = get_ai_category(name)
-                comm_rate = COMMISSIONS.get(category, 0.10)
+                comm_rate = COMMISSIONS.get(category, 0.15)
                 logistics = calculate_logistics(l, w, h, weight)
                 
-                # Current
                 ref_fee = price * comm_rate
                 acq_cost = price * (acquiring/100)
                 early_cost = price * (early_payout/100)
@@ -113,7 +154,6 @@ if uploaded_file:
                 profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
                 margin = (profit / price) * 100 if price > 0 else 0
                 
-                # Target
                 rec_price = find_target_price(cost, logistics, comm_rate, acquiring, early_payout, tax_system, target_margin)
                 
                 results.append({
@@ -123,15 +163,19 @@ if uploaded_file:
                     "Рек. Цена": round(rec_price, 0)
                 })
             except Exception as e:
-                st.error(f"Ошибка {sku}: {e}")
+                st.error(f"Ошибка в строке {index}: {e}")
         status.update(label="✅ Готово!", state="complete")
 
-    res_df = pd.DataFrame(results)
-    st.dataframe(res_df.style.background_gradient(subset=['Маржа %'], cmap='RdYlGn'), use_container_width=True)
-    
-    csv = res_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 Скачать результат", csv, "analysis.csv", "text/csv")
+    if results:
+        res_df = pd.DataFrame(results)
+        st.dataframe(res_df.style.background_gradient(subset=['Маржа %'], cmap='RdYlGn'), use_container_width=True)
+        csv = res_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 Скачать результат", csv, "analysis.csv", "text/csv")
+    else:
+        st.warning("Не удалось обработать данные. Проверьте формат файла.")
 else:
     st.info("Скачайте шаблон в боковой панели, заполните его и загрузите обратно.")
     st.markdown("### 📝 Структура файла")
+    template_df = pd.DataFrame(columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"])
+    template_df.loc[0] = ["SKU-001", "Пример товара", 10, 10, 10, 0.5, 2990, 1500]
     st.table(template_df)
