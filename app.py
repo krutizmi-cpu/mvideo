@@ -2,6 +2,7 @@ import io
 import json
 import re
 import sqlite3
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -20,7 +21,7 @@ DEFAULT_COMMISSION_RATE = 0.20
 @st.cache_data
 def load_commissions() -> pd.DataFrame:
     def _prepare(df: pd.DataFrame) -> pd.DataFrame:
-        df["Комиссия"] = df["Комиссия"].str.replace(",", ".").astype(float) / 100
+        df["Комиссия"] = df["Комиссия"].str.replace(",", ".", regex=False).astype(float) / 100
         for col in ["Подкатегория", "Планнейм", "Группа Товаров"]:
             df[col] = df[col].fillna("").str.strip()
         return df
@@ -81,15 +82,18 @@ def init_db():
             commission_level TEXT NOT NULL,
             commission_key TEXT NOT NULL,
             margin REAL NOT NULL DEFAULT 0,
+            markup REAL NOT NULL DEFAULT 0,
             profit REAL NOT NULL DEFAULT 0,
+            full_cost REAL NOT NULL DEFAULT 0,
+            rec_margin REAL NOT NULL DEFAULT 0,
+            rec_profit REAL NOT NULL DEFAULT 0,
             target_margin REAL NOT NULL DEFAULT 0,
-            rec_price REAL NOT NULL DEFAULT 0,
+            rec_price REAL,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """
     )
 
-    # Миграции для старой структуры
     c.execute("PRAGMA table_info(products)")
     cols = {row[1] for row in c.fetchall()}
     to_add = {
@@ -97,9 +101,13 @@ def init_db():
         "logistics": "REAL NOT NULL DEFAULT 0",
         "logistics_type": "TEXT NOT NULL DEFAULT ''",
         "margin": "REAL NOT NULL DEFAULT 0",
+        "markup": "REAL NOT NULL DEFAULT 0",
         "profit": "REAL NOT NULL DEFAULT 0",
+        "full_cost": "REAL NOT NULL DEFAULT 0",
+        "rec_margin": "REAL NOT NULL DEFAULT 0",
+        "rec_profit": "REAL NOT NULL DEFAULT 0",
         "target_margin": "REAL NOT NULL DEFAULT 0",
-        "rec_price": "REAL NOT NULL DEFAULT 0",
+        "rec_price": "REAL",
         "updated_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
     }
     for col, ddl in to_add.items():
@@ -124,12 +132,14 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+
 def token_overlap_score(left: str, right: str) -> float:
     left_tokens = set(normalize_text(left).split())
     right_tokens = set(normalize_text(right).split())
     if not left_tokens or not right_tokens:
         return 0.0
     return len(left_tokens & right_tokens) / max(len(right_tokens), 1)
+
 
 
 def get_openai_api_key(manual_key: str = "") -> str:
@@ -139,6 +149,7 @@ def get_openai_api_key(manual_key: str = "") -> str:
         return str(st.secrets.get("OPENAI_API_KEY", "")).strip()
     except Exception:
         return ""
+
 
 
 def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
@@ -155,6 +166,12 @@ def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
         max_value += delta
 
     return min_value, max_value
+
+
+
+def format_optional_price(value: Optional[float]) -> Optional[float]:
+    return None if value is None else round(value, 0)
+
 
 
 def normalize_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -195,6 +212,7 @@ def normalize_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
 def find_row_by_category_name(category_name: str):
     category_name_norm = normalize_text(category_name)
     if not category_name_norm:
@@ -205,6 +223,7 @@ def find_row_by_category_name(category_name: str):
             if normalize_text(row[key]) == category_name_norm:
                 return row, key, row[key]
     return None
+
 
 
 def is_accessory_bike_mismatch(product_name: str, category_name: str) -> bool:
@@ -228,6 +247,7 @@ def is_accessory_bike_mismatch(product_name: str, category_name: str) -> bool:
         return True
 
     return False
+
 
 
 def ai_match_category(name: str, api_key: str):
@@ -264,13 +284,13 @@ def ai_match_category(name: str, api_key: str):
         return None
 
 
+
 def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
     if not name or name == "Неизвестно":
         return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
 
     name_norm = normalize_text(name)
 
-    # 1) Прямое вхождение
     for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
         for row in commissions_list:
             category = row[field]
@@ -280,7 +300,6 @@ def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
                     continue
                 return row["Комиссия"], field, category
 
-    # 2) Fuzzy
     best = None
     for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
         for row in commissions_list:
@@ -297,7 +316,6 @@ def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
         _, row, field, category = best
         return row["Комиссия"], f"{field} (fuzzy)", category
 
-    # 3) AI fallback (кэш -> запрос -> кэш)
     api_key = get_openai_api_key(openai_key)
     if api_key:
         c = conn.cursor()
@@ -321,8 +339,6 @@ def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
                 conn.commit()
                 return row["Комиссия"], f"AI Match ({field})", label
 
-    # Спец-эвристика: полноценный велосипед, но подходящей категории в справочнике нет.
-    name_norm = normalize_text(name)
     if "велосипед" in name_norm and not any(
         w in name_norm for w in ["рама", "креплен", "запчаст", "аксесс", "для авто"]
     ):
@@ -331,6 +347,9 @@ def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
     return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
 
 
+# ══════════════════════════════════════════════════════════════
+# CALCULATIONS
+# ══════════════════════════════════════════════════════════════
 def calculate_logistics(l, w, h, weight):
     """
     Габариты приходят в сантиметрах.
@@ -364,6 +383,12 @@ def calculate_logistics(l, w, h, weight):
     return 110, "Малогабаритный (S)"
 
 
+
+def vat_part(amount: float) -> float:
+    return max(0.0, amount) * 20 / 120
+
+
+
 def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
     if tax_system == "УСН Доходы (6%)":
         return price * 0.06
@@ -371,58 +396,128 @@ def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
     if tax_system == "Самозанятый (4%)":
         return price * 0.04
 
-    if tax_system == "ОСНО (20%)":
-        # Упрощенно: выделяем НДС из цены (если цена на полке включает НДС)
-        return price * 20 / 120
-
     if tax_system == "УСН Доходы-Расходы (15%)":
         expenses = cost + logistics + commission + acq + early
         profit_before_tax = price - expenses
-        tax_15 = max(0, profit_before_tax * 0.15)
+        tax_15 = max(0.0, profit_before_tax * 0.15)
         min_tax = price * 0.01
         return max(tax_15, min_tax)
 
-    return 0
+    if tax_system == "ОСНО (упрощённая, 22%)":
+        output_vat = vat_part(price)
+        preliminary_profit = price - (cost + logistics + commission + acq + early + output_vat)
+        income_tax = max(0.0, preliminary_profit * 0.22)
+        return output_vat + income_tax
+
+    if tax_system == "ОСНО (реальная, 22%)":
+        output_vat = vat_part(price)
+        input_vat = (
+            vat_part(cost)
+            + vat_part(logistics)
+            + vat_part(commission)
+            + vat_part(acq)
+            + vat_part(early)
+        )
+        vat_payable = max(0.0, output_vat - input_vat)
+
+        revenue_wo_vat = price - output_vat
+        cost_wo_vat = cost - vat_part(cost)
+        logistics_wo_vat = logistics - vat_part(logistics)
+        commission_wo_vat = commission - vat_part(commission)
+        acq_wo_vat = acq - vat_part(acq)
+        early_wo_vat = early - vat_part(early)
+
+        profit_before_income_tax = (
+            revenue_wo_vat
+            - cost_wo_vat
+            - logistics_wo_vat
+            - commission_wo_vat
+            - acq_wo_vat
+            - early_wo_vat
+        )
+        income_tax = max(0.0, profit_before_income_tax * 0.22)
+        return vat_payable + income_tax
+
+    return 0.0
+
+
+
+def calculate_unit_metrics(
+    price: float,
+    cost: float,
+    logistics: float,
+    commission_rate: float,
+    acq_rate_percent: float,
+    early_rate_percent: float,
+    tax_system: str,
+) -> dict:
+    price = max(float(price), 0.0)
+    cost = max(float(cost), 0.0)
+    logistics = max(float(logistics), 0.0)
+    commission_rate = max(float(commission_rate), 0.0)
+    acq_rate_decimal = max(float(acq_rate_percent), 0.0) / 100
+    early_rate_decimal = max(float(early_rate_percent), 0.0) / 100
+
+    commission_fee = price * commission_rate
+    acquiring_cost = price * acq_rate_decimal
+    payout_base = max(0.0, price - commission_fee - logistics - acquiring_cost)
+    early_fee = payout_base * early_rate_decimal
+    tax_cost = calculate_tax(price, cost, logistics, commission_fee, acquiring_cost, early_fee, tax_system)
+
+    full_cost = cost + logistics + commission_fee + acquiring_cost + early_fee + tax_cost
+    profit = price - full_cost
+
+    margin_percent = ((price / full_cost) - 1) * 100 if full_cost > 0 else 0.0
+    markup_percent = ((price - full_cost) / full_cost) * 100 if full_cost > 0 else 0.0
+
+    return {
+        "commission_fee": commission_fee,
+        "acquiring_cost": acquiring_cost,
+        "payout_base": payout_base,
+        "early_fee": early_fee,
+        "tax_cost": tax_cost,
+        "full_cost": full_cost,
+        "profit": profit,
+        "margin_percent": margin_percent,
+        "markup_percent": markup_percent,
+    }
+
 
 
 def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
-    """
-    Подбор цены под целевую маржинальность (profit/price) численным методом.
-    Учитывает, что быстрый вывод считается от суммы к выводу:
-    payout_base = price - commission - logistics.
-    """
     target_margin_decimal = target_m / 100
-    acq_decimal = acq_rate / 100
-    early_decimal = early_rate / 100
 
-    def calc_margin_for_price(price: float) -> float:
-        ref_fee = price * commission_rate
-        acq_cost = price * acq_decimal
-        payout_base = max(0.0, price - ref_fee - logistics)
-        early_cost = payout_base * early_decimal
-        tax_cost = calculate_tax(price, cost, logistics, ref_fee, acq_cost, early_cost, tax_type)
-        profit = price - (cost + logistics + ref_fee + acq_cost + early_cost + tax_cost)
-        return profit / price if price > 0 else -1.0
+    def calc_margin_for_price(candidate_price: float) -> float:
+        metrics = calculate_unit_metrics(
+            price=candidate_price,
+            cost=cost,
+            logistics=logistics,
+            commission_rate=commission_rate,
+            acq_rate_percent=acq_rate,
+            early_rate_percent=early_rate,
+            tax_system=tax_type,
+        )
+        return metrics["margin_percent"] / 100
 
     low = max(cost + logistics, 1.0)
     high = max(low * 2, 1000.0)
 
-    for _ in range(30):
+    for _ in range(40):
         if calc_margin_for_price(high) >= target_margin_decimal:
             break
         high *= 1.5
     else:
-        return 0
+        return None
 
-    for _ in range(60):
+    for _ in range(80):
         mid = (low + high) / 2
-        current_margin = calc_margin_for_price(mid)
-        if current_margin >= target_margin_decimal:
+        if calc_margin_for_price(mid) >= target_margin_decimal:
             high = mid
         else:
             low = mid
 
     return round(high, 2)
+
 
 
 def save_calculation_to_db(row: dict):
@@ -435,8 +530,10 @@ def save_calculation_to_db(row: dict):
             sku, name, cost, price, stock,
             logistics, logistics_type,
             commission_rate, commission_level, commission_key,
-            margin, profit, target_margin, rec_price, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            margin, markup, profit, full_cost,
+            rec_margin, rec_profit,
+            target_margin, rec_price, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(sku) DO UPDATE SET
             name=excluded.name,
             cost=excluded.cost,
@@ -448,7 +545,11 @@ def save_calculation_to_db(row: dict):
             commission_level=excluded.commission_level,
             commission_key=excluded.commission_key,
             margin=excluded.margin,
+            markup=excluded.markup,
             profit=excluded.profit,
+            full_cost=excluded.full_cost,
+            rec_margin=excluded.rec_margin,
+            rec_profit=excluded.rec_profit,
             target_margin=excluded.target_margin,
             rec_price=excluded.rec_price,
             updated_at=CURRENT_TIMESTAMP
@@ -464,10 +565,14 @@ def save_calculation_to_db(row: dict):
             float(row["Комиссия %"]) / 100,
             row["Уровень"],
             row["Категория"],
-            float(row["Маржа %"]),
-            float(row["Прибыль"]),
-            float(row["Цель Маржа %"]),
-            float(row["Рек. Цена"]),
+            float(row["Маржинальность % (от текущей цены)"]),
+            float(row["Наценка % (от текущей цены)"]),
+            float(row["Прибыль (от текущей цены)"]),
+            float(row["Полная себестоимость (от текущей цены)"]),
+            float(row["Маржинальность % (от рек. цены)"]) if row["Маржинальность % (от рек. цены)"] is not None else 0.0,
+            float(row["Прибыль (от рек. цены)"]) if row["Прибыль (от рек. цены)"] is not None else 0.0,
+            float(row["Целевая маржинальность %"]),
+            float(row["Рек. Цена"]) if row["Рек. Цена"] is not None else None,
         ),
     )
     conn.commit()
@@ -478,13 +583,19 @@ def save_calculation_to_db(row: dict):
 # ══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.header("⚙️ Глобальные настройки")
-    acquiring = st.number_input("Эквайринг (%)", 0.0, 10.0, 1.5)
+    acquiring = st.number_input("Эквайринг (%)", 0.0, 20.0, 1.5)
     tax_system = st.selectbox(
         "Налоги",
-        ["УСН Доходы (6%)", "УСН Доходы-Расходы (15%)", "ОСНО (20%)", "Самозанятый (4%)"],
+        [
+            "УСН Доходы (6%)",
+            "УСН Доходы-Расходы (15%)",
+            "ОСНО (реальная, 22%)",
+            "ОСНО (упрощённая, 22%)",
+            "Самозанятый (4%)",
+        ],
     )
-    early_payout = st.number_input("Досрочный вывод (%)", 0.0, 10.0, 0.0)
-    target_margin = st.number_input("🎯 Целевая маржа (%)", 0.0, 100.0, 20.0)
+    early_payout = st.number_input("Досрочный вывод (%)", 0.0, 20.0, 0.0)
+    target_margin = st.number_input("🎯 Целевая маржинальность (%)", 0.0, 1000.0, 20.0)
 
     st.markdown("---")
     openai_key = st.text_input("OpenAI API Key (опционально)", type="password")
@@ -546,23 +657,38 @@ with tab1:
 
                     comm_rate, comm_level, comm_key = find_commission(name, openai_key)
                     logistics, logistics_type = calculate_logistics(l, w, h, weight)
-                    ref_fee = price * comm_rate
-                    acq_cost = price * (acquiring / 100)
-                    payout_base = max(0.0, price - ref_fee - logistics)
-                    early_cost = payout_base * (early_payout / 100)
-                    tax_cost = calculate_tax(price, cost, logistics, ref_fee, acq_cost, early_cost, tax_system)
 
-                    profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
-                    margin = (profit / price) * 100 if price > 0 else 0
-                    rec_price = find_target_price(
-                        cost,
-                        logistics,
-                        comm_rate,
-                        acquiring,
-                        early_payout,
-                        tax_system,
-                        target_margin,
+                    current_metrics = calculate_unit_metrics(
+                        price=price,
+                        cost=cost,
+                        logistics=logistics,
+                        commission_rate=comm_rate,
+                        acq_rate_percent=acquiring,
+                        early_rate_percent=early_payout,
+                        tax_system=tax_system,
                     )
+
+                    rec_price = find_target_price(
+                        cost=cost,
+                        logistics=logistics,
+                        commission_rate=comm_rate,
+                        acq_rate=acquiring,
+                        early_rate=early_payout,
+                        tax_type=tax_system,
+                        target_m=target_margin,
+                    )
+
+                    rec_metrics = None
+                    if rec_price is not None:
+                        rec_metrics = calculate_unit_metrics(
+                            price=rec_price,
+                            cost=cost,
+                            logistics=logistics,
+                            commission_rate=comm_rate,
+                            acq_rate_percent=acquiring,
+                            early_rate_percent=early_payout,
+                            tax_system=tax_system,
+                        )
 
                     result_row = {
                         "Артикул": sku,
@@ -574,10 +700,14 @@ with tab1:
                         "Тек. Цена": round(price, 2),
                         "Логистика": round(logistics, 2),
                         "Тип логистики": logistics_type,
-                        "Маржа %": round(margin, 2),
-                        "Прибыль": round(profit, 2),
-                        "Цель Маржа %": target_margin,
-                        "Рек. Цена": round(rec_price, 0),
+                        "Полная себестоимость (от текущей цены)": round(current_metrics["full_cost"], 2),
+                        "Маржинальность % (от текущей цены)": round(current_metrics["margin_percent"], 2),
+                        "Наценка % (от текущей цены)": round(current_metrics["markup_percent"], 2),
+                        "Прибыль (от текущей цены)": round(current_metrics["profit"], 2),
+                        "Целевая маржинальность %": float(target_margin),
+                        "Рек. Цена": format_optional_price(rec_price),
+                        "Маржинальность % (от рек. цены)": round(rec_metrics["margin_percent"], 2) if rec_metrics else None,
+                        "Прибыль (от рек. цены)": round(rec_metrics["profit"], 2) if rec_metrics else None,
                         "Остаток": 0,
                     }
                     results.append(result_row)
@@ -590,17 +720,23 @@ with tab1:
 
         if results:
             res_df = pd.DataFrame(results)
-            margin_min, margin_max = get_progress_bounds(res_df["Маржа %"])
+            margin_min, margin_max = get_progress_bounds(res_df["Маржинальность % (от текущей цены)"])
             st.dataframe(
                 res_df,
                 use_container_width=True,
                 column_config={
-                    "Маржа %": st.column_config.ProgressColumn(
-                        "Маржа %",
+                    "Маржинальность % (от текущей цены)": st.column_config.ProgressColumn(
+                        "Маржинальность % (от текущей цены)",
                         format="%.2f%%",
                         min_value=margin_min,
                         max_value=margin_max,
-                    )
+                    ),
+                    "Маржинальность % (от рек. цены)": st.column_config.NumberColumn(
+                        "Маржинальность % (от рек. цены)", format="%.2f%%"
+                    ),
+                    "Наценка % (от текущей цены)": st.column_config.NumberColumn(
+                        "Наценка % (от текущей цены)", format="%.2f%%"
+                    ),
                 },
             )
 
@@ -621,7 +757,7 @@ with tab1:
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 2: ALL PRODUCTS (memory by SKU + export)
+# TAB 2: ALL PRODUCTS
 # ══════════════════════════════════════════════════════════════
 with tab2:
     df_products = pd.read_sql_query(
@@ -632,14 +768,18 @@ with tab2:
             name AS "Наименование",
             cost AS "Себестоимость",
             price AS "Тек. Цена",
+            full_cost AS "Полная себестоимость (от текущей цены)",
             logistics AS "Логистика",
             logistics_type AS "Тип логистики",
             ROUND(commission_rate * 100, 1) AS "Комиссия %",
             commission_level AS "Уровень",
             commission_key AS "Категория",
-            margin AS "Маржа %",
-            profit AS "Прибыль",
-            target_margin AS "Цель Маржа %",
+            margin AS "Маржинальность % (от текущей цены)",
+            markup AS "Наценка % (от текущей цены)",
+            profit AS "Прибыль (от текущей цены)",
+            rec_margin AS "Маржинальность % (от рек. цены)",
+            rec_profit AS "Прибыль (от рек. цены)",
+            target_margin AS "Целевая маржинальность %",
             rec_price AS "Рек. Цена",
             updated_at AS "Обновлено"
         FROM products
@@ -651,17 +791,23 @@ with tab2:
     if df_products.empty:
         st.info("Товаров пока нет. Загрузите Excel в первой вкладке.")
     else:
-        margin_min, margin_max = get_progress_bounds(df_products["Маржа %"])
+        margin_min, margin_max = get_progress_bounds(df_products["Маржинальность % (от текущей цены)"])
         st.dataframe(
             df_products,
             use_container_width=True,
             column_config={
-                "Маржа %": st.column_config.ProgressColumn(
-                    "Маржа %",
+                "Маржинальность % (от текущей цены)": st.column_config.ProgressColumn(
+                    "Маржинальность % (от текущей цены)",
                     format="%.2f%%",
                     min_value=margin_min,
                     max_value=margin_max,
-                )
+                ),
+                "Маржинальность % (от рек. цены)": st.column_config.NumberColumn(
+                    "Маржинальность % (от рек. цены)", format="%.2f%%"
+                ),
+                "Наценка % (от текущей цены)": st.column_config.NumberColumn(
+                    "Наценка % (от текущей цены)", format="%.2f%%"
+                ),
             },
         )
 
