@@ -30,6 +30,8 @@ def load_commissions():
         st.error(f"Ошибка загрузки комиссий: {e}")
         return pd.DataFrame(columns=["Подкатегория", "Планнейм", "Группа Товаров", "Комиссия"])
 
+DEFAULT_COMMISSION_RATE = 0.20
+
 commission_df = load_commissions()
 
 # Оптимизация поиска: переводим в список словарей один раз
@@ -37,7 +39,7 @@ commissions_list = commission_df.to_dict('records')
 
 def find_commission(name: str, openai_key: str = None) -> tuple:
     if not name or name == "Неизвестно":
-        return 0.15, "Others (дефолт)", "Others"
+        return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
     
     name_lower = name.lower()
     
@@ -59,7 +61,7 @@ def find_commission(name: str, openai_key: str = None) -> tuple:
         if subcat and subcat in name_lower:
             return row["Комиссия"], "Подкатегория", row["Подкатегория"]
 
-    # 4. Если есть API ключ и ничего не нашли — пробуем AI
+    # 4. Если есть API ключ и ничего не ншли — пробуем AI
     if openai_key:
         # Проверяем кэш AI
         c = conn.cursor()
@@ -76,7 +78,7 @@ def find_commission(name: str, openai_key: str = None) -> tuple:
         # В реальном приложении здесь должен быть запрос к OpenAI
         # Но чтобы не вешать приложение, оставим заглушку или сделаем быстрый запрос
     
-    return 0.15, "Others (дефолт)", "Others"
+    return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
 
 # ══════════════════════════════════════════════════════════════
 # БАЗА ДАННЫХ
@@ -156,6 +158,22 @@ def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, ta
         return 0
     return (cost + logistics) / denom
 
+
+def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return 0.0, 1.0
+
+    min_value = float(cleaned.min())
+    max_value = float(cleaned.max())
+
+    if min_value == max_value:
+        delta = max(abs(min_value) * 0.01, 1.0)
+        min_value -= delta
+        max_value += delta
+
+    return min_value, max_value
+
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════
@@ -196,7 +214,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "📦 Массовый расчёт (Excel)",
     "➕ Добавить товар",
     "📋 Все товары",
-    "📊 Аналитика"
+    "📊 Аналтика"
 ])
 
 # ══════════════════════════════════════════════════════════════
@@ -253,6 +271,7 @@ with tab1:
         
         if results:
             res_df = pd.DataFrame(results)
+            margin_min, margin_max = get_progress_bounds(res_df["Маржа %"])
             st.dataframe(
                 res_df,
                 use_container_width=True,
@@ -260,8 +279,8 @@ with tab1:
                     "Маржа %": st.column_config.ProgressColumn(
                         "Маржа %",
                         format="%.2f%%",
-                        min_value=float(res_df["Маржа %"].min()),
-                        max_value=float(res_df["Маржа %"].max()),
+                        min_value=margin_min,
+                        max_value=margin_max,
                     )
                 }
             )
@@ -312,10 +331,8 @@ with tab3:
         df_products["Маржа"] = (df_products["Выплата от М.Видео"] - df_products["cost"]).round(2)
         df_products["ROI (%)"] = ((df_products["Маржа"] / df_products["cost"]) * 100).round(1)
         
-        margin_min = float(df_products["Маржа"].min())
-        margin_max = float(df_products["Маржа"].max())
-        roi_min = float(df_products["ROI (%)"].min())
-        roi_max = float(df_products["ROI (%)"].max())
+        margin_min, margin_max = get_progress_bounds(df_products["Маржа"])
+        roi_min, roi_max = get_progress_bounds(df_products["ROI (%)"])
         
         st.dataframe(
             df_products[[
