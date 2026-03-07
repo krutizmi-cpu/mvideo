@@ -55,7 +55,7 @@ def find_commission(name: str) -> tuple:
     return 0.15, "Others (дефолт)", "Others"
 
 # ══════════════════════════════════════════════════════════════
-# БАЗА ДАННЫХ (кэш AI + товары)
+# БАЗА ДАННЫХ
 # ══════════════════════════════════════════════════════════════
 
 @st.cache_resource
@@ -117,35 +117,8 @@ def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, ta
         return 0
     return (cost + logistics) / denom
 
-def get_ai_category(product_name, api_key=None):
-    """Используется только если нужен fallback через OpenAI — основной поиск через find_commission."""
-    c = conn.cursor()
-    c.execute("SELECT category FROM ai_cache WHERE name=?", (product_name,))
-    cached = c.fetchone()
-    if cached:
-        return cached[0]
-    category = "Others"
-    if api_key:
-        try:
-            client = OpenAI(api_key=api_key)
-            cats = commission_df["Подкатегория"].dropna().unique().tolist()
-            prompt = f"Определи категорию товара '{product_name}' из списка: {', '.join(cats[:50])}. Ответь только названием категории."
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                timeout=5
-            )
-            ai_cat = response.choices[0].message.content.strip()
-            if ai_cat in cats:
-                category = ai_cat
-        except:
-            pass
-    c.execute("INSERT OR REPLACE INTO ai_cache VALUES (?, ?)", (product_name, category))
-    conn.commit()
-    return category
-
 # ══════════════════════════════════════════════════════════════
-# SIDEBAR — глобальные настройки
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════
 
 with st.sidebar:
@@ -161,7 +134,9 @@ with st.sidebar:
     openai_key = st.text_input("OpenAI API Key (опционально)", type="password")
     st.markdown("---")
     st.subheader("📁 Шаблон для загрузки")
-    template_df = pd.DataFrame(columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"])
+    template_df = pd.DataFrame(
+        columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"]
+    )
     template_df.loc[0] = ["SKU-001", "Пример товара", 10, 10, 10, 0.5, 2990, 1500]
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -201,42 +176,44 @@ with tab1:
         with st.status("🔍 Обработка...") as status:
             for index, row in df_upload.iterrows():
                 try:
-                    name = str(row.get("наименование", "Неизвестно"))
-                    sku = str(row.get("артикул", f"Row-{index}"))
-                    price = float(row.get("цена", 0))
-                    cost = float(row.get("себестоимость", 0))
-                    l = float(row.get("д", 0))
-                    w = float(row.get("ш", 0))
-                    h = float(row.get("в", 0))
-                    weight = float(row.get("вес", 0))
+                    name     = str(row.get("наименование", "Неизвестно"))
+                    sku      = str(row.get("артикул", f"Row-{index}"))
+                    price    = float(row.get("цена", 0))
+                    cost     = float(row.get("себестоимость", 0))
+                    l        = float(row.get("д", 0))
+                    w        = float(row.get("ш", 0))
+                    h        = float(row.get("в", 0))
+                    weight   = float(row.get("вес", 0))
 
                     comm_rate, comm_level, comm_key = find_commission(name)
                     logistics = calculate_logistics(l, w, h, weight)
 
-                    ref_fee = price * comm_rate
-                    acq_cost = price * (acquiring / 100)
+                    ref_fee    = price * comm_rate
+                    acq_cost   = price * (acquiring / 100)
                     early_cost = price * (early_payout / 100)
-                    tax_cost = calculate_tax(price, tax_system)
+                    tax_cost   = calculate_tax(price, tax_system)
 
                     profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
                     margin = (profit / price) * 100 if price > 0 else 0
 
                     rec_price = find_target_price(
-                        cost, logistics, comm_rate, acquiring, early_payout, tax_system, target_margin
+                        cost, logistics, comm_rate,
+                        acquiring, early_payout,
+                        tax_system, target_margin
                     )
 
                     results.append({
-                        "Артикул": sku,
+                        "Артикул":      sku,
                         "Наименование": name,
-                        "Категория": comm_key,
-                        "Уровень": comm_level,
-                        "Комиссия %": round(comm_rate * 100, 1),
-                        "Тек. Цена": price,
-                        "Логистика": round(logistics, 2),
-                        "Маржа %": round(margin, 2),
-                        "Прибыль": round(profit, 2),
+                        "Категория":    comm_key,
+                        "Уровень":      comm_level,
+                        "Комиссия %":   round(comm_rate * 100, 1),
+                        "Тек. Цена":    price,
+                        "Логистика":    round(logistics, 2),
+                        "Маржа %":      round(margin, 2),
+                        "Прибыль":      round(profit, 2),
                         "Цель Маржа %": target_margin,
-                        "Рек. Цена": round(rec_price, 0)
+                        "Рек. Цена":    round(rec_price, 0)
                     })
                 except Exception as e:
                     st.error(f"Ошибка в строке {index}: {e}")
@@ -246,8 +223,16 @@ with tab1:
         if results:
             res_df = pd.DataFrame(results)
             st.dataframe(
-                res_df.style.background_gradient(subset=["Маржа %"], cmap="RdYlGn"),
-                use_container_width=True
+                res_df,
+                use_container_width=True,
+                column_config={
+                    "Маржа %": st.column_config.ProgressColumn(
+                        "Маржа %",
+                        format="%.2f%%",
+                        min_value=float(res_df["Маржа %"].min()),
+                        max_value=float(res_df["Маржа %"].max()),
+                    )
+                }
             )
             csv = res_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button("📥 Скачать результат", csv, "results.csv", "text/csv")
@@ -263,21 +248,25 @@ with tab1:
 
 with tab2:
     with st.form("add_product"):
-        name_input = st.text_input("Название товара")
-        cost_input = st.number_input("Себестоимость (₽)", min_value=0.0, step=100.0)
+        name_input  = st.text_input("Название товара")
+        cost_input  = st.number_input("Себестоимость (₽)", min_value=0.0, step=100.0)
         price_input = st.number_input("Цена продажи (₽)", min_value=0.0, step=100.0)
         stock_input = st.number_input("Остаток на складе (шт)", min_value=0, step=1, value=0)
-        submitted = st.form_submit_button("Добавить")
+        submitted   = st.form_submit_button("Добавить")
 
         if submitted and name_input and cost_input > 0 and price_input > 0:
             rate, level, key = find_commission(name_input)
             c = conn.cursor()
             c.execute("""
-                INSERT INTO products (name, cost, price, stock, commission_rate, commission_level, commission_key)
+                INSERT INTO products
+                    (name, cost, price, stock, commission_rate, commission_level, commission_key)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (name_input, cost_input, price_input, stock_input, rate, level, key))
             conn.commit()
-            st.success(f"✅ Товар добавлен! Комиссия {rate*100:.1f}% — найдена по уровню «{level}» → {key}")
+            st.success(
+                f"✅ Товар добавлен! Комиссия {rate*100:.1f}% — "
+                f"найдена по уровню «{level}» → {key}"
+            )
             st.rerun()
 
 # ══════════════════════════════════════════════════════════════
@@ -290,6 +279,26 @@ with tab3:
     if df_products.empty:
         st.info("Товаров пока нет")
     else:
-        df_products["Комиссия М.Видео"] = (df_products["price"] * df_products["commission_rate"]).round(2)
+        df_products["Комиссия М.Видео"]  = (df_products["price"] * df_products["commission_rate"]).round(2)
         df_products["Выплата от М.Видео"] = (df_products["price"] - df_products["Комиссия М.Видео"]).round(2)
-        df
+        df_products["Маржа"]             = (df_products["Выплата от М.Видео"] - df_products["cost"]).round(2)
+        df_products["ROI (%)"]           = ((df_products["Маржа"] / df_products["cost"]) * 100).round(1)
+
+        st.dataframe(
+            df_products[[
+                "id", "name", "cost", "price", "stock",
+                "commission_rate", "commission_level", "commission_key",
+                "Комиссия М.Видео", "Выплата от М.Видео", "Маржа", "ROI (%)"
+            ]],
+            use_container_width=True,
+            column_config={
+                "Маржа": st.column_config.ProgressColumn(
+                    "Маржа (₽)",
+                    format="%.2f ₽",
+                    min_value=float(df_products["Маржа"].min()),
+                    max_value=float(df_products["Маржа"].max()),
+                ),
+                "ROI (%)": st.column_config.ProgressColumn(
+                    "ROI (%)",
+                    format="%.1f%%",
+                    min_value=float(df_products
