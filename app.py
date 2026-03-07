@@ -17,7 +17,7 @@ st.set_page_config(page_title="M.Video Economics", layout="wide")
 @st.cache_data
 def load_commissions():
     df = pd.read_csv(
-        "commissions.csv",
+        "https://raw.githubusercontent.com/krutizmi-cpu/mvideo/main/commissions.csv",
         sep=";",
         encoding="utf-8-sig",
         dtype=str
