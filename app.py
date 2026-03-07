@@ -309,4 +309,36 @@ with tab3:
         )
 
         st.markdown("---")
-        del_id = st.number
+        del_id = st.number_input("ID товара для удаления", min_value=0, step=1, value=0)
+        if st.button("🗑️ Удалить товар") and del_id > 0:
+            c = conn.cursor()
+            c.execute("DELETE FROM products WHERE id = ?", (del_id,))
+            conn.commit()
+            st.success(f"Товар с ID {del_id} удалён.")
+            st.rerun()
+
+# ══════════════════════════════════════════════════════════════
+# TAB 4: Аналитика
+# ══════════════════════════════════════════════════════════════
+with tab4:
+    df_analytics = pd.read_sql_query("SELECT * FROM products", conn)
+    if df_analytics.empty:
+        st.info("Нет данных для аналитики. Добавьте товары.")
+    else:
+        df_analytics["Комиссия М.Видео"] = (df_analytics["price"] * df_analytics["commission_rate"]).round(2)
+        df_analytics["Выплата от М.Видео"] = (df_analytics["price"] - df_analytics["Комиссия М.Видео"]).round(2)
+        df_analytics["Маржа"] = (df_analytics["Выплата от М.Видео"] - df_analytics["cost"]).round(2)
+        df_analytics["ROI (%)"] = ((df_analytics["Маржа"] / df_analytics["cost"]) * 100).round(1)
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Товаров", len(df_analytics))
+        col2.metric("Сред. маржа (%)", f"{(df_analytics['Маржа'] / df_analytics['price'] * 100).mean():.1f}%")
+        col3.metric("Сред. ROI (%)", f"{df_analytics['ROI (%)'].mean():.1f}%")
+        col4.metric("Общая прибыль (₽)", f"{(df_analytics['Маржа'] * df_analytics['stock']).sum():,.0f} ₽")
+
+        st.markdown("---")
+        st.subheader("📊 Маржа по товарам")
+        st.bar_chart(df_analytics.set_index("name")["Маржа"])
+
+        st.subheader("📈 ROI по товарам")
+        st.bar_chart(df_analytics.set_index("name")["ROI (%)"])
