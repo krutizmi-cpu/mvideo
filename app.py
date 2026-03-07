@@ -33,25 +33,21 @@ commission_df = load_commissions()
 def find_commission(name: str) -> tuple:
     name_lower = name.lower()
 
-    # 1️⃣ Поиск по Группе Товаров (самый точный)
     for _, row in commission_df.iterrows():
         group = str(row["Группа Товаров"]).lower()
         if group and (group in name_lower or name_lower in group):
             return row["Комиссия"], "Группа Товаров", row["Группа Товаров"]
 
-    # 2️⃣ Поиск по Планнейм
     for _, row in commission_df.iterrows():
         plan = str(row["Планнейм"]).lower()
         if plan and (plan in name_lower or name_lower in plan):
             return row["Комиссия"], "Планнейм", row["Планнейм"]
 
-    # 3️⃣ Поиск по Подкатегории
     for _, row in commission_df.iterrows():
         subcat = str(row["Подкатегория"]).lower()
         if subcat and subcat in name_lower:
             return row["Комиссия"], "Подкатегория", row["Подкатегория"]
 
-    # 4️⃣ Дефолт
     return 0.15, "Others (дефолт)", "Others"
 
 # ══════════════════════════════════════════════════════════════
@@ -279,10 +275,15 @@ with tab3:
     if df_products.empty:
         st.info("Товаров пока нет")
     else:
-        df_products["Комиссия М.Видео"]  = (df_products["price"] * df_products["commission_rate"]).round(2)
+        df_products["Комиссия М.Видео"]   = (df_products["price"] * df_products["commission_rate"]).round(2)
         df_products["Выплата от М.Видео"] = (df_products["price"] - df_products["Комиссия М.Видео"]).round(2)
-        df_products["Маржа"]             = (df_products["Выплата от М.Видео"] - df_products["cost"]).round(2)
-        df_products["ROI (%)"]           = ((df_products["Маржа"] / df_products["cost"]) * 100).round(1)
+        df_products["Маржа"]              = (df_products["Выплата от М.Видео"] - df_products["cost"]).round(2)
+        df_products["ROI (%)"]            = ((df_products["Маржа"] / df_products["cost"]) * 100).round(1)
+
+        margin_min = float(df_products["Маржа"].min())
+        margin_max = float(df_products["Маржа"].max())
+        roi_min    = float(df_products["ROI (%)"].min())
+        roi_max    = float(df_products["ROI (%)"].max())
 
         st.dataframe(
             df_products[[
@@ -295,10 +296,17 @@ with tab3:
                 "Маржа": st.column_config.ProgressColumn(
                     "Маржа (₽)",
                     format="%.2f ₽",
-                    min_value=float(df_products["Маржа"].min()),
-                    max_value=float(df_products["Маржа"].max()),
+                    min_value=margin_min,
+                    max_value=margin_max,
                 ),
                 "ROI (%)": st.column_config.ProgressColumn(
                     "ROI (%)",
                     format="%.1f%%",
-                    min_value=float(df_products
+                    min_value=roi_min,
+                    max_value=roi_max,
+                )
+            }
+        )
+
+        st.markdown("---")
+        del_id = st.number
