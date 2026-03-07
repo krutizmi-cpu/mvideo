@@ -367,36 +367,62 @@ def calculate_logistics(l, w, h, weight):
 def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
     if tax_system == "УСН Доходы (6%)":
         return price * 0.06
+
     if tax_system == "Самозанятый (4%)":
         return price * 0.04
+
     if tax_system == "ОСНО (20%)":
-        return price * 0.20
+        # Упрощенно: выделяем НДС из цены (если цена на полке включает НДС)
+        return price * 20 / 120
+
     if tax_system == "УСН Доходы-Расходы (15%)":
         expenses = cost + logistics + commission + acq + early
         profit_before_tax = price - expenses
-        return max(0, profit_before_tax * 0.15)
+        tax_15 = max(0, profit_before_tax * 0.15)
+        min_tax = price * 0.01
+        return max(tax_15, min_tax)
+
     return 0
 
 
 def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
-    m_decimal = target_m / 100
-    acq_dec = acq_rate / 100
-    early_dec = early_rate / 100
+    """
+    Подбор цены под целевую маржинальность (profit/price) численным методом.
+    Учитывает, что быстрый вывод считается от суммы к выводу:
+    payout_base = price - commission - logistics.
+    """
+    target_margin_decimal = target_m / 100
+    acq_decimal = acq_rate / 100
+    early_decimal = early_rate / 100
 
-    if tax_type == "УСН Доходы (6%)":
-        tax_rate = 0.06
-    elif tax_type == "Самозанятый (4%)":
-        tax_rate = 0.04
-    elif tax_type == "ОСНО (20%)":
-        tax_rate = 0.20
-    elif tax_type == "УСН Доходы-Расходы (15%)":
-        denom = (1 - m_decimal - commission_rate - acq_dec - early_dec) * 0.85
-        return 0 if denom <= 0 else (cost + logistics) / denom
+    def calc_margin_for_price(price: float) -> float:
+        ref_fee = price * commission_rate
+        acq_cost = price * acq_decimal
+        payout_base = max(0.0, price - ref_fee - logistics)
+        early_cost = payout_base * early_decimal
+        tax_cost = calculate_tax(price, cost, logistics, ref_fee, acq_cost, early_cost, tax_type)
+        profit = price - (cost + logistics + ref_fee + acq_cost + early_cost + tax_cost)
+        return profit / price if price > 0 else -1.0
+
+    low = max(cost + logistics, 1.0)
+    high = max(low * 2, 1000.0)
+
+    for _ in range(30):
+        if calc_margin_for_price(high) >= target_margin_decimal:
+            break
+        high *= 1.5
     else:
-        tax_rate = 0
+        return 0
 
-    denom = 1 - m_decimal - commission_rate - acq_dec - early_dec - tax_rate
-    return 0 if denom <= 0 else (cost + logistics) / denom
+    for _ in range(60):
+        mid = (low + high) / 2
+        current_margin = calc_margin_for_price(mid)
+        if current_margin >= target_margin_decimal:
+            high = mid
+        else:
+            low = mid
+
+    return round(high, 2)
 
 
 def save_calculation_to_db(row: dict):
@@ -522,7 +548,8 @@ with tab1:
                     logistics, logistics_type = calculate_logistics(l, w, h, weight)
                     ref_fee = price * comm_rate
                     acq_cost = price * (acquiring / 100)
-                    early_cost = price * (early_payout / 100)
+                    payout_base = max(0.0, price - ref_fee - logistics)
+                    early_cost = payout_base * (early_payout / 100)
                     tax_cost = calculate_tax(price, cost, logistics, ref_fee, acq_cost, early_cost, tax_system)
 
                     profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
