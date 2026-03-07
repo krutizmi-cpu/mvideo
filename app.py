@@ -3,9 +3,10 @@ import sqlite3
 import pandas as pd
 import io
 import json
+import re
 from openai import OpenAI
 
-# ══════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="M.Video Economics", layout="wide")
@@ -37,47 +38,128 @@ commission_df = load_commissions()
 # Оптимизация поиска: переводим в список словарей один раз
 commissions_list = commission_df.to_dict('records')
 
+
+def normalize_text(value: str) -> str:
+    value = (value or "").lower().strip()
+    value = value.replace("ё", "е")
+    value = re.sub(r"[^a-zа-я0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def token_overlap_score(left: str, right: str) -> float:
+    left_tokens = set(normalize_text(left).split())
+    right_tokens = set(normalize_text(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    common = len(left_tokens & right_tokens)
+    base = max(len(right_tokens), 1)
+    return common / base
+
+
+def find_row_by_category_name(category_name: str):
+    category_name_norm = normalize_text(category_name)
+    if not category_name_norm:
+        return None
+
+    for row in commissions_list:
+        for key in ["Группа Товаров", "Планнейм", "Подкатегория"]:
+            if normalize_text(row[key]) == category_name_norm:
+                return row
+    return None
+
+
+def get_openai_api_key(manual_key: str = "") -> str:
+    if manual_key and manual_key.strip():
+        return manual_key.strip()
+    try:
+        return str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def ai_match_category(name: str, api_key: str):
+    categories = sorted({
+        row[field].strip()
+        for row in commissions_list
+        for field in ["Группа Товаров", "Планнейм", "Подкатегория"]
+        if row[field].strip()
+    })
+    if not categories:
+        return None
+
+    prompt = (
+        "Выбери ОДНУ лучшую категорию из списка для названия товара. "
+        "Если подходящей категории нет, ответь NONE. "
+        "Ответ строго JSON: {\"category\":\"...\"}.\n\n"
+        f"Название товара: {name}\n\n"
+        "Список категорий:\n"
+        + "\n".join(f"- {c}" for c in categories)
+    )
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=prompt,
+            temperature=0,
+        )
+        payload = json.loads(response.output_text)
+        selected = str(payload.get("category", "")).strip()
+        if not selected or selected.upper() == "NONE":
+            return None
+        return selected
+    except Exception:
+        return None
+
+
 def find_commission(name: str, openai_key: str = None) -> tuple:
     if not name or name == "Неизвестно":
         return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
-    
-    name_lower = name.lower()
-    
-    # 1. Сначала ищем по Группе Товаров (самый точный уровень)
-    for row in commissions_list:
-        group = row["Группа Товаров"].lower()
-        if group and (group in name_lower or name_lower in group):
-            return row["Комиссия"], "Группа Товаров", row["Группа Товаров"]
-            
-    # 2. Затем по Планнейму
-    for row in commissions_list:
-        plan = row["Планнейм"].lower()
-        if plan and (plan in name_lower or name_lower in plan):
-            return row["Комиссия"], "Планнейм", row["Планнейм"]
-            
-    # 3. Затем по Подкатегории
-    for row in commissions_list:
-        subcat = row["Подкатегория"].lower()
-        if subcat and subcat in name_lower:
-            return row["Комиссия"], "Подкатегория", row["Подкатегория"]
 
-    # 4. Если есть API ключ и ничего не ншли — пробуем AI
-    if openai_key:
-        # Проверяем кэш AI
+    name_norm = normalize_text(name)
+
+    # 1) Прямое вхождение с приоритетом: Группа Товаров -> Планнейм -> Подкатегория
+    for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
+        for row in commissions_list:
+            category_value = row[field]
+            category_norm = normalize_text(category_value)
+            if category_norm and (category_norm in name_norm or name_norm in category_norm):
+                return row["Комиссия"], field, category_value
+
+    # 2) Мягкое совпадение по общим токенам
+    best = None
+    for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
+        for row in commissions_list:
+            category_value = row[field]
+            score = token_overlap_score(name, category_value)
+            if score >= 0.6 and (best is None or score > best[0]):
+                best = (score, row, field, category_value)
+    if best:
+        _, row, field, category_value = best
+        return row["Комиссия"], f"{field} (fuzzy)", category_value
+
+    # 3) AI fallback: сначала кэш, потом OpenAI
+    api_key = get_openai_api_key(openai_key)
+    if api_key:
         c = conn.cursor()
         c.execute("SELECT category FROM ai_cache WHERE name = ?", (name,))
         cached = c.fetchone()
         if cached:
-            # Находим данные по кэшированной категории
-            cat_name = cached[0]
-            for row in commissions_list:
-                if row["Группа Товаров"] == cat_name or row["Планнейм"] == cat_name or row["Подкатегория"] == cat_name:
-                    return row["Комиссия"], "AI Match", cat_name
-        
-        # Если в кэше нет — зовем AI (очень упрощенно для примера)
-        # В реальном приложении здесь должен быть запрос к OpenAI
-        # Но чтобы не вешать приложение, оставим заглушку или сделаем быстрый запрос
-    
+            row = find_row_by_category_name(cached[0])
+            if row:
+                return row["Комиссия"], "AI Cache", cached[0]
+
+        ai_category = ai_match_category(name, api_key)
+        if ai_category:
+            row = find_row_by_category_name(ai_category)
+            if row:
+                c.execute(
+                    "INSERT OR REPLACE INTO ai_cache (name, category) VALUES (?, ?)",
+                    (name, ai_category),
+                )
+                conn.commit()
+                return row["Комиссия"], "AI Match", ai_category
+
     return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
 
 # ══════════════════════════════════════════════════════════════
@@ -114,9 +196,38 @@ conn = init_db()
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ══════════════════════════════════════════════════════════════
 def calculate_logistics(l, w, h, weight):
-    vol_weight = (l * w * h) / 5000
-    billable_weight = max(weight, vol_weight)
-    return 50 + (billable_weight * 20)
+    """
+    Расчет логистики по таблице тарифов:
+    - S: 110 ₽
+    - M: 190 ₽
+    - L / XL: 1290 ₽
+
+    Предполагается, что размеры в см, вес в кг.
+    """
+    l = max(float(l), 0.0)
+    w = max(float(w), 0.0)
+    h = max(float(h), 0.0)
+    weight = max(float(weight), 0.0)
+
+    volume_m3 = (l * w * h) / 1_000_000
+    volume_liters = l * w * h / 1000
+    max_side = max(l, w, h)
+    sum_sides = l + w + h
+
+    # Негабарит (XL)
+    if max_side > 120 or sum_sides > 180:
+        return 1290, "Негабарит (XL)"
+
+    # Крупногабарит (L)
+    if volume_m3 > 0.2 or volume_liters > 200 or weight > 25:
+        return 1290, "Крупногабаритный (L)"
+
+    # Среднегабарит (M)
+    if volume_m3 >= 0.01 or volume_liters >= 10 or weight > 5:
+        return 190, "Среднегабаритный (M)"
+
+    # Малый (S)
+    return 110, "Малогабаритный (S)"
 
 def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
     if tax_system == "УСН Доходы (6%)":
@@ -214,8 +325,13 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "📦 Массовый расчёт (Excel)",
     "➕ Добавить товар",
     "📋 Все товары",
-    "📊 Аналтика"
+    "📊 Аналитика"
 ])
+
+st.caption(
+    "Вкладки: «Массовый расчёт» — расчет из Excel; «Добавить товар» — ручой ввод одной позиции; "
+    "«Все товары» — список с расчетом маржи/ROI; «Аналитика» — агрегированные метрики и графики."
+)
 
 # ══════════════════════════════════════════════════════════════
 # TAB 1: Массовый расчёт из Excel
@@ -238,7 +354,7 @@ with tab1:
                     weight = float(row.get("вес", 0))
                     
                     comm_rate, comm_level, comm_key = find_commission(name, openai_key)
-                    logistics = calculate_logistics(l, w, h, weight)
+                    logistics, logistics_type = calculate_logistics(l, w, h, weight)
                     ref_fee = price * comm_rate
                     acq_cost = price * (acquiring / 100)
                     early_cost = price * (early_payout / 100)
@@ -260,6 +376,7 @@ with tab1:
                         "Комиссия %": round(comm_rate * 100, 1),
                         "Тек. Цена": price,
                         "Логистика": round(logistics, 2),
+                        "Тип логистики": logistics_type,
                         "Маржа %": round(margin, 2),
                         "Прибыль": round(profit, 2),
                         "Цель Маржа %": target_margin,
