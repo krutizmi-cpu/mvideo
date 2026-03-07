@@ -19,22 +19,30 @@ DEFAULT_COMMISSION_RATE = 0.20
 # ══════════════════════════════════════════════════════════════
 @st.cache_data
 def load_commissions() -> pd.DataFrame:
+    def _prepare(df: pd.DataFrame) -> pd.DataFrame:
+        df["Комиссия"] = df["Комиссия"].str.replace(",", ".").astype(float) / 100
+        for col in ["Подкатегория", "Планнейм", "Группа Товаров"]:
+            df[col] = df[col].fillna("").str.strip()
+        return df
+
     try:
-        df = pd.read_csv(
+        remote_df = pd.read_csv(
             "https://raw.githubusercontent.com/krutizmi-cpu/mvideo/main/commissions.csv",
             sep=";",
             encoding="utf-8-sig",
             dtype=str,
         )
-        df["Комиссия"] = df["Комиссия"].str.replace(",", ".").astype(float) / 100
-        for col in ["Подкатегория", "Планнейм", "Группа Товаров"]:
-            df[col] = df[col].fillna("").str.strip()
-        return df
-    except Exception as e:
-        st.error(f"Ошибка загрузки коиссий: {e}")
-        return pd.DataFrame(
-            columns=["Подкатегория", "Планнейм", "Группа Товаров", "Комиссия"]
-        )
+        return _prepare(remote_df)
+    except Exception as remote_error:
+        try:
+            local_df = pd.read_csv("commissions.csv", sep=";", encoding="utf-8-sig", dtype=str)
+            st.warning("Не удалось загрузить комиссии из GitHub, используется локальный commissions.csv")
+            return _prepare(local_df)
+        except Exception as local_error:
+            st.error(f"Ошибка загрузки комиссий: remote={remote_error}; local={local_error}")
+            return pd.DataFrame(
+                columns=["Подкатегория", "Планнейм", "Группа Товаров", "Комиссия"]
+            )
 
 
 commission_df = load_commissions()
@@ -147,6 +155,44 @@ def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
         max_value += delta
 
     return min_value, max_value
+
+
+def normalize_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
+    alias_map = {
+        "артикул": "артикул",
+        "sku": "артикул",
+        "наименование": "наименование",
+        "название": "наименование",
+        "д": "д",
+        "д(см)": "д",
+        "длина": "д",
+        "длина(см)": "д",
+        "ш": "ш",
+        "ш(см)": "ш",
+        "ширина": "ш",
+        "ширина(см)": "ш",
+        "в": "в",
+        "в(см)": "в",
+        "высота": "в",
+        "высота(см)": "в",
+        "вес": "вес",
+        "вес(кг)": "вес",
+        "масса": "вес",
+        "масса(кг)": "вес",
+        "цена": "цена",
+        "себестоимость": "себестоимость",
+    }
+
+    normalized = []
+    for col in df.columns:
+        c = str(col).lower().replace("ё", "е").strip()
+        c = c.replace(" ", "")
+        c = alias_map.get(c, c)
+        normalized.append(c)
+
+    df = df.copy()
+    df.columns = normalized
+    return df
 
 
 def find_row_by_category_name(category_name: str):
@@ -274,6 +320,13 @@ def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
                 )
                 conn.commit()
                 return row["Комиссия"], f"AI Match ({field})", label
+
+    # Спец-эвристика: полноценный велосипед, но подходящей категории в справочнике нет.
+    name_norm = normalize_text(name)
+    if "велосипед" in name_norm and not any(
+        w in name_norm for w in ["рама", "креплен", "запчаст", "аксесс", "для авто"]
+    ):
+        return DEFAULT_COMMISSION_RATE, "Эвристика (велосипед)", "Велосипед"
 
     return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
 
@@ -413,7 +466,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📁 Шаблон для загрузки")
     template_df = pd.DataFrame(
-        columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"]
+        columns=["артикул", "наименование", "д (см)", "ш (см)", "в (см)", "вес (кг)", "цена", "себестоимость"]
     )
     template_df.loc[0] = ["SKU-001", "Пример товара", 10, 10, 10, 0.5, 2990, 1500]
 
@@ -439,7 +492,7 @@ st.title("💼 M.Video — Юнит-экономика")
 tab1, tab2 = st.tabs(["📦 Массовый расчёт (Excel)", "📋 Все товары"])
 
 st.caption(
-    "Работаем только через масовую загрузку Excel. После расчета товар сохраняется по артикулу (SKU): "
+    "Работаем только через массовую загрузку Excel. После расчета товар сохраняется по артикулу (SKU): "
     "повторная загрузка того же артикула обновляет запись."
 )
 
@@ -450,7 +503,7 @@ st.caption(
 with tab1:
     if uploaded_file:
         df_upload = pd.read_excel(uploaded_file)
-        df_upload.columns = [str(c).strip().lower() for c in df_upload.columns]
+        df_upload = normalize_excel_columns(df_upload)
         results = []
 
         with st.status("🔍 Обработка...") as status:
@@ -524,8 +577,15 @@ with tab1:
                 },
             )
 
-            csv = res_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 Скачать результат CSV", csv, "results.csv", "text/csv")
+            out_res = io.BytesIO()
+            with pd.ExcelWriter(out_res, engine="openpyxl") as writer:
+                res_df.to_excel(writer, index=False, sheet_name="results")
+            st.download_button(
+                "📥 Скачать результат Excel",
+                out_res.getvalue(),
+                "results.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         else:
             st.warning("Нет данных для отображения.")
     else:
