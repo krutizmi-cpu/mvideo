@@ -1,44 +1,114 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
 import io
 import json
 import re
+import sqlite3
+
+import pandas as pd
+import streamlit as st
 from openai import OpenAI
 
-# ═════════════════════════════════════════════════════════════
-# PAGE CONFIG
+# ══════════════════════════════════════════════════════════════
+# CONFIG
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="M.Video Economics", layout="wide")
+DEFAULT_COMMISSION_RATE = 0.20
+
 
 # ══════════════════════════════════════════════════════════════
-# ЗАГРУЗКА КОМИССИЙ ИЗ CSV
+# COMMISSIONS
 # ══════════════════════════════════════════════════════════════
 @st.cache_data
-def load_commissions():
+def load_commissions() -> pd.DataFrame:
     try:
         df = pd.read_csv(
             "https://raw.githubusercontent.com/krutizmi-cpu/mvideo/main/commissions.csv",
             sep=";",
             encoding="utf-8-sig",
-            dtype=str
+            dtype=str,
         )
         df["Комиссия"] = df["Комиссия"].str.replace(",", ".").astype(float) / 100
         for col in ["Подкатегория", "Планнейм", "Группа Товаров"]:
             df[col] = df[col].fillna("").str.strip()
         return df
     except Exception as e:
-        st.error(f"Ошибка загрузки комиссий: {e}")
-        return pd.DataFrame(columns=["Подкатегория", "Планнейм", "Группа Товаров", "Комиссия"])
+        st.error(f"Ошибка загрузки коиссий: {e}")
+        return pd.DataFrame(
+            columns=["Подкатегория", "Планнейм", "Группа Товаров", "Комиссия"]
+        )
 
-DEFAULT_COMMISSION_RATE = 0.20
 
 commission_df = load_commissions()
-
-# Оптимизация поиска: переводим в список словарей один раз
-commissions_list = commission_df.to_dict('records')
+commissions_list = commission_df.to_dict("records")
 
 
+# ══════════════════════════════════════════════════════════════
+# DB
+# ══════════════════════════════════════════════════════════════
+@st.cache_resource
+def init_db():
+    conn = sqlite3.connect("mvideo.db", check_same_thread=False)
+    c = conn.cursor()
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_cache (
+            name TEXT PRIMARY KEY,
+            category TEXT
+        )
+    """
+    )
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT,
+            name TEXT NOT NULL,
+            cost REAL NOT NULL,
+            price REAL NOT NULL,
+            stock INTEGER NOT NULL DEFAULT 0,
+            logistics REAL NOT NULL DEFAULT 0,
+            logistics_type TEXT NOT NULL DEFAULT '',
+            commission_rate REAL NOT NULL,
+            commission_level TEXT NOT NULL,
+            commission_key TEXT NOT NULL,
+            margin REAL NOT NULL DEFAULT 0,
+            profit REAL NOT NULL DEFAULT 0,
+            target_margin REAL NOT NULL DEFAULT 0,
+            rec_price REAL NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+    )
+
+    # Миграции для старой структуры
+    c.execute("PRAGMA table_info(products)")
+    cols = {row[1] for row in c.fetchall()}
+    to_add = {
+        "sku": "TEXT",
+        "logistics": "REAL NOT NULL DEFAULT 0",
+        "logistics_type": "TEXT NOT NULL DEFAULT ''",
+        "margin": "REAL NOT NULL DEFAULT 0",
+        "profit": "REAL NOT NULL DEFAULT 0",
+        "target_margin": "REAL NOT NULL DEFAULT 0",
+        "rec_price": "REAL NOT NULL DEFAULT 0",
+        "updated_at": "TEXT DEFAULT CURRENT_TIMESTAMP",
+    }
+    for col, ddl in to_add.items():
+        if col not in cols:
+            c.execute(f"ALTER TABLE products ADD COLUMN {col} {ddl}")
+
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_sku ON products(sku)")
+    conn.commit()
+    return conn
+
+
+conn = init_db()
+
+
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
 def normalize_text(value: str) -> str:
     value = (value or "").lower().strip()
     value = value.replace("ё", "е")
@@ -51,21 +121,7 @@ def token_overlap_score(left: str, right: str) -> float:
     right_tokens = set(normalize_text(right).split())
     if not left_tokens or not right_tokens:
         return 0.0
-    common = len(left_tokens & right_tokens)
-    base = max(len(right_tokens), 1)
-    return common / base
-
-
-def find_row_by_category_name(category_name: str):
-    category_name_norm = normalize_text(category_name)
-    if not category_name_norm:
-        return None
-
-    for row in commissions_list:
-        for key in ["Группа Товаров", "Планнейм", "Подкатегория"]:
-            if normalize_text(row[key]) == category_name_norm:
-                return row
-    return None
+    return len(left_tokens & right_tokens) / max(len(right_tokens), 1)
 
 
 def get_openai_api_key(manual_key: str = "") -> str:
@@ -75,199 +131,6 @@ def get_openai_api_key(manual_key: str = "") -> str:
         return str(st.secrets.get("OPENAI_API_KEY", "")).strip()
     except Exception:
         return ""
-
-
-def ai_match_category(name: str, api_key: str):
-    categories = sorted({
-        row[field].strip()
-        for row in commissions_list
-        for field in ["Группа Товаров", "Планнейм", "Подкатегория"]
-        if row[field].strip()
-    })
-    if not categories:
-        return None
-
-    prompt = (
-        "Выбери ОДНУ лучшую категорию из списка для названия товара. "
-        "Если подходящей категории нет, ответь NONE. "
-        "Ответ строго JSON: {\"category\":\"...\"}.\n\n"
-        f"Название товара: {name}\n\n"
-        "Список категорий:\n"
-        + "\n".join(f"- {c}" for c in categories)
-    )
-
-    try:
-        client = OpenAI(api_key=api_key)
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=prompt,
-            temperature=0,
-        )
-        payload = json.loads(response.output_text)
-        selected = str(payload.get("category", "")).strip()
-        if not selected or selected.upper() == "NONE":
-            return None
-        return selected
-    except Exception:
-        return None
-
-
-def find_commission(name: str, openai_key: str = None) -> tuple:
-    if not name or name == "Неизвестно":
-        return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
-
-    name_norm = normalize_text(name)
-
-    # 1) Прямое вхождение с приоритетом: Группа Товаров -> Планнейм -> Подкатегория
-    for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
-        for row in commissions_list:
-            category_value = row[field]
-            category_norm = normalize_text(category_value)
-            if category_norm and (category_norm in name_norm or name_norm in category_norm):
-                return row["Комиссия"], field, category_value
-
-    # 2) Мягкое совпадение по общим токенам
-    best = None
-    for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
-        for row in commissions_list:
-            category_value = row[field]
-            score = token_overlap_score(name, category_value)
-            if score >= 0.6 and (best is None or score > best[0]):
-                best = (score, row, field, category_value)
-    if best:
-        _, row, field, category_value = best
-        return row["Комиссия"], f"{field} (fuzzy)", category_value
-
-    # 3) AI fallback: сначала кэш, потом OpenAI
-    api_key = get_openai_api_key(openai_key)
-    if api_key:
-        c = conn.cursor()
-        c.execute("SELECT category FROM ai_cache WHERE name = ?", (name,))
-        cached = c.fetchone()
-        if cached:
-            row = find_row_by_category_name(cached[0])
-            if row:
-                return row["Комиссия"], "AI Cache", cached[0]
-
-        ai_category = ai_match_category(name, api_key)
-        if ai_category:
-            row = find_row_by_category_name(ai_category)
-            if row:
-                c.execute(
-                    "INSERT OR REPLACE INTO ai_cache (name, category) VALUES (?, ?)",
-                    (name, ai_category),
-                )
-                conn.commit()
-                return row["Комиссия"], "AI Match", ai_category
-
-    return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
-
-# ══════════════════════════════════════════════════════════════
-# БАЗА ДАННЫХ
-# ══════════════════════════════════════════════════════════════
-@st.cache_resource
-def init_db():
-    conn = sqlite3.connect("mvideo.db", check_same_thread=False)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS ai_cache (
-            name TEXT PRIMARY KEY,
-            category TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            cost REAL NOT NULL,
-            price REAL NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            commission_rate REAL NOT NULL,
-            commission_level TEXT NOT NULL,
-            commission_key TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-# ══════════════════════════════════════════════════════════════
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════════════════════
-def calculate_logistics(l, w, h, weight):
-    """
-    Расчет логистики по таблице тарифов:
-    - S: 110 ₽
-    - M: 190 ₽
-    - L / XL: 1290 ₽
-
-    Предполагается, что размеры в см, вес в кг.
-    """
-    l = max(float(l), 0.0)
-    w = max(float(w), 0.0)
-    h = max(float(h), 0.0)
-    weight = max(float(weight), 0.0)
-
-    volume_m3 = (l * w * h) / 1_000_000
-    volume_liters = l * w * h / 1000
-    max_side = max(l, w, h)
-    sum_sides = l + w + h
-
-    # Негабарит (XL)
-    if max_side > 120 or sum_sides > 180:
-        return 1290, "Негабарит (XL)"
-
-    # Крупногабарит (L)
-    if volume_m3 > 0.2 or volume_liters > 200 or weight > 25:
-        return 1290, "Крупногабаритный (L)"
-
-    # Среднегабарит (M)
-    if volume_m3 >= 0.01 or volume_liters >= 10 or weight > 5:
-        return 190, "Среднегабаритный (M)"
-
-    # Малый (S)
-    return 110, "Малогабаритный (S)"
-
-def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
-    if tax_system == "УСН Доходы (6%)":
-        return price * 0.06
-    elif tax_system == "Самозанятый (4%)":
-        return price * 0.04
-    elif tax_system == "ОСНО (20%)":
-        return price * 0.20
-    elif tax_system == "УСН Доходы-Расходы (15%)":
-        # Налог 15% от (Доходы - Расходы)
-        expenses = cost + logistics + commission + acq + early
-        profit_before_tax = price - expenses
-        return max(0, profit_before_tax * 0.15)
-    else:
-        return 0
-
-def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
-    # Приблизительный расчет целевой цены
-    m_decimal = target_m / 100
-    acq_dec = acq_rate / 100
-    early_dec = early_rate / 100
-    
-    if tax_type == "УСН Доходы (6%)":
-        tax_rate = 0.06
-    elif tax_type == "Самозанятый (4%)":
-        tax_rate = 0.04
-    elif tax_type == "ОСНО (20%)":
-        tax_rate = 0.20
-    elif tax_type == "УСН Доходы-Расходы (15%)":
-        # Упрощенно для этой системы (налог на прибыль)
-        # Price = Cost + Log + Comm + Acq + Early + TargetProfit + 0.15*(Price - ...)
-        # Denom adjusted for 15% on margin
-        denom = (1 - m_decimal - commission_rate - acq_dec - early_dec) * 0.85
-        if denom <= 0: return 0
-        return (cost + logistics) / denom
-        
-    denom = 1 - m_decimal - commission_rate - acq_dec - early_dec - tax_rate
-    if denom <= 0:
-        return 0
-    return (cost + logistics) / denom
 
 
 def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
@@ -285,6 +148,252 @@ def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
 
     return min_value, max_value
 
+
+def find_row_by_category_name(category_name: str):
+    category_name_norm = normalize_text(category_name)
+    if not category_name_norm:
+        return None
+
+    for row in commissions_list:
+        for key in ["Группа Товаров", "Планнейм", "Подкатегория"]:
+            if normalize_text(row[key]) == category_name_norm:
+                return row, key, row[key]
+    return None
+
+
+def is_accessory_bike_mismatch(product_name: str, category_name: str) -> bool:
+    product = normalize_text(product_name)
+    category = normalize_text(category_name)
+
+    is_bike = "велосипед" in product
+    looks_like_full_bike = (
+        is_bike
+        and "рама" not in product
+        and "запчаст" not in product
+        and "аксесс" not in product
+        and "креплен" not in product
+    )
+
+    accessory_words = ["рама", "креплен", "для авто", "багажн", "аксесс", "запчаст"]
+    if looks_like_full_bike and any(w in category for w in accessory_words):
+        return True
+
+    if "авто" not in product and "для авто" in category:
+        return True
+
+    return False
+
+
+def ai_match_category(name: str, api_key: str):
+    categories = sorted(
+        {
+            row[field].strip()
+            for row in commissions_list
+            for field in ["Группа Товаров", "Планнейм", "Подкатегория"]
+            if row[field].strip()
+        }
+    )
+    if not categories:
+        return None
+
+    prompt = (
+        "Выбери ОДНУ лучшую категорию из списка для названия товара. "
+        "Если подходящей категории нет, ответь NONE. "
+        "Важно: если товар — полноценный велосипед, не выбирай категории для авто-креплений и запчастей. "
+        "Ответ строго JSON: {\"category\":\"...\"}.\n\n"
+        f"Название товара: {name}\n\n"
+        "Список категорий:\n"
+        + "\n".join(f"- {c}" for c in categories)
+    )
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(model="gpt-4o-mini", input=prompt, temperature=0)
+        payload = json.loads(response.output_text)
+        selected = str(payload.get("category", "")).strip()
+        if not selected or selected.upper() == "NONE":
+            return None
+        return selected
+    except Exception:
+        return None
+
+
+def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
+    if not name or name == "Неизвестно":
+        return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
+
+    name_norm = normalize_text(name)
+
+    # 1) Прямое вхождение
+    for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
+        for row in commissions_list:
+            category = row[field]
+            cat_norm = normalize_text(category)
+            if cat_norm and (cat_norm in name_norm or name_norm in cat_norm):
+                if is_accessory_bike_mismatch(name, category):
+                    continue
+                return row["Комиссия"], field, category
+
+    # 2) Fuzzy
+    best = None
+    for field in ["Группа Товаров", "Планнейм", "Подкатегория"]:
+        for row in commissions_list:
+            category = row[field]
+            score = token_overlap_score(name, category)
+            if score < 0.6:
+                continue
+            if is_accessory_bike_mismatch(name, category):
+                continue
+            if best is None or score > best[0]:
+                best = (score, row, field, category)
+
+    if best:
+        _, row, field, category = best
+        return row["Комиссия"], f"{field} (fuzzy)", category
+
+    # 3) AI fallback (кэш -> запрос -> кэш)
+    api_key = get_openai_api_key(openai_key)
+    if api_key:
+        c = conn.cursor()
+        c.execute("SELECT category FROM ai_cache WHERE name = ?", (name,))
+        cached = c.fetchone()
+        if cached:
+            found = find_row_by_category_name(cached[0])
+            if found and not is_accessory_bike_mismatch(name, cached[0]):
+                row, field, label = found
+                return row["Комиссия"], f"AI Cache ({field})", label
+
+        ai_category = ai_match_category(name, api_key)
+        if ai_category and not is_accessory_bike_mismatch(name, ai_category):
+            found = find_row_by_category_name(ai_category)
+            if found:
+                row, field, label = found
+                c.execute(
+                    "INSERT OR REPLACE INTO ai_cache (name, category) VALUES (?, ?)",
+                    (name, ai_category),
+                )
+                conn.commit()
+                return row["Комиссия"], f"AI Match ({field})", label
+
+    return DEFAULT_COMMISSION_RATE, "Others (дефолт)", "Others"
+
+
+def calculate_logistics(l, w, h, weight):
+    """
+    Габариты приходят в сантиметрах.
+
+    Тарифы:
+    - S: 110 ₽
+    - M: 190 ₽
+    - L/XL: 1290 ₽
+
+    Логика классов:
+    - XL: любая сторона > 120 см
+    - L: объем > 0.2 м3 или > 200 л или вес > 15 кг
+    - M: объем >= 0.01 м3 или >= 10 л
+    - S: остальное
+    """
+    l = max(float(l), 0.0)
+    w = max(float(w), 0.0)
+    h = max(float(h), 0.0)
+    weight = max(float(weight), 0.0)
+
+    volume_m3 = (l * w * h) / 1_000_000
+    volume_liters = (l * w * h) / 1000
+    max_side = max(l, w, h)
+
+    if max_side > 120:
+        return 1290, "Негабарит (XL)"
+    if volume_m3 > 0.2 or volume_liters > 200 or weight > 15:
+        return 1290, "Крупногабаритный (L)"
+    if volume_m3 >= 0.01 or volume_liters >= 10:
+        return 190, "Среднегабаритный (M)"
+    return 110, "Малогабаритный (S)"
+
+
+def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
+    if tax_system == "УСН Доходы (6%)":
+        return price * 0.06
+    if tax_system == "Самозанятый (4%)":
+        return price * 0.04
+    if tax_system == "ОСНО (20%)":
+        return price * 0.20
+    if tax_system == "УСН Доходы-Расходы (15%)":
+        expenses = cost + logistics + commission + acq + early
+        profit_before_tax = price - expenses
+        return max(0, profit_before_tax * 0.15)
+    return 0
+
+
+def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
+    m_decimal = target_m / 100
+    acq_dec = acq_rate / 100
+    early_dec = early_rate / 100
+
+    if tax_type == "УСН Доходы (6%)":
+        tax_rate = 0.06
+    elif tax_type == "Самозанятый (4%)":
+        tax_rate = 0.04
+    elif tax_type == "ОСНО (20%)":
+        tax_rate = 0.20
+    elif tax_type == "УСН Доходы-Расходы (15%)":
+        denom = (1 - m_decimal - commission_rate - acq_dec - early_dec) * 0.85
+        return 0 if denom <= 0 else (cost + logistics) / denom
+    else:
+        tax_rate = 0
+
+    denom = 1 - m_decimal - commission_rate - acq_dec - early_dec - tax_rate
+    return 0 if denom <= 0 else (cost + logistics) / denom
+
+
+def save_calculation_to_db(row: dict):
+    c = conn.cursor()
+    sku = row["Артикул"]
+
+    c.execute(
+        """
+        INSERT INTO products (
+            sku, name, cost, price, stock,
+            logistics, logistics_type,
+            commission_rate, commission_level, commission_key,
+            margin, profit, target_margin, rec_price, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(sku) DO UPDATE SET
+            name=excluded.name,
+            cost=excluded.cost,
+            price=excluded.price,
+            stock=excluded.stock,
+            logistics=excluded.logistics,
+            logistics_type=excluded.logistics_type,
+            commission_rate=excluded.commission_rate,
+            commission_level=excluded.commission_level,
+            commission_key=excluded.commission_key,
+            margin=excluded.margin,
+            profit=excluded.profit,
+            target_margin=excluded.target_margin,
+            rec_price=excluded.rec_price,
+            updated_at=CURRENT_TIMESTAMP
+    """,
+        (
+            sku,
+            row["Наименование"],
+            float(row["Себестоимость"]),
+            float(row["Тек. Цена"]),
+            int(row.get("Остаток", 0)),
+            float(row["Логистика"]),
+            row["Тип логистики"],
+            float(row["Комиссия %"]) / 100,
+            row["Уровень"],
+            row["Категория"],
+            float(row["Маржа %"]),
+            float(row["Прибыль"]),
+            float(row["Цель Маржа %"]),
+            float(row["Рек. Цена"]),
+        ),
+    )
+    conn.commit()
+
+
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════
@@ -293,99 +402,112 @@ with st.sidebar:
     acquiring = st.number_input("Эквайринг (%)", 0.0, 10.0, 1.5)
     tax_system = st.selectbox(
         "Налоги",
-        ["УСН Доходы (6%)", "УСН Доходы-Расходы (15%)", "ОСНО (20%)", "Самозанятый (4%)"]
+        ["УСН Доходы (6%)", "УСН Доходы-Расходы (15%)", "ОСНО (20%)", "Самозанятый (4%)"],
     )
     early_payout = st.number_input("Досрочный вывод (%)", 0.0, 10.0, 0.0)
     target_margin = st.number_input("🎯 Целевая маржа (%)", 0.0, 100.0, 20.0)
+
     st.markdown("---")
     openai_key = st.text_input("OpenAI API Key (опционально)", type="password")
+
     st.markdown("---")
     st.subheader("📁 Шаблон для загрузки")
     template_df = pd.DataFrame(
         columns=["артикул", "наименование", "д", "ш", "в", "вес", "цена", "себестоимость"]
     )
     template_df.loc[0] = ["SKU-001", "Пример товара", 10, 10, 10, 0.5, 2990, 1500]
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         template_df.to_excel(writer, index=False)
+
     st.download_button(
         "📥 Скачать шаблон Excel",
         buffer.getvalue(),
         "template.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
+        use_container_width=True,
     )
+
     uploaded_file = st.file_uploader("Загрузите файл Excel", type=["xlsx"])
 
+
 # ══════════════════════════════════════════════════════════════
-# ЗАГОЛОВОК + ТАБЫ
+# TITLE + 2 TABS
 # ══════════════════════════════════════════════════════════════
 st.title("💼 M.Video — Юнит-экономика")
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📦 Массовый расчёт (Excel)",
-    "➕ Добавить товар",
-    "📋 Все товары",
-    "📊 Аналитика"
-])
+tab1, tab2 = st.tabs(["📦 Массовый расчёт (Excel)", "📋 Все товары"])
 
 st.caption(
-    "Вкладки: «Массовый расчёт» — расчет из Excel; «Добавить товар» — ручой ввод одной позиции; "
-    "«Все товары» — список с расчетом маржи/ROI; «Аналитика» — агрегированные метрики и графики."
+    "Работаем только через масовую загрузку Excel. После расчета товар сохраняется по артикулу (SKU): "
+    "повторная загрузка того же артикула обновляет запись."
 )
 
+
 # ══════════════════════════════════════════════════════════════
-# TAB 1: Массовый расчёт из Excel
+# TAB 1: MASS CALC FROM EXCEL
 # ══════════════════════════════════════════════════════════════
 with tab1:
     if uploaded_file:
         df_upload = pd.read_excel(uploaded_file)
         df_upload.columns = [str(c).strip().lower() for c in df_upload.columns]
         results = []
+
         with st.status("🔍 Обработка...") as status:
             for index, row in df_upload.iterrows():
                 try:
                     name = str(row.get("наименование", "Неизвестно"))
-                    sku = str(row.get("артикул", f"Row-{index}"))
+                    sku = str(row.get("артикул", f"Row-{index}")).strip() or f"Row-{index}"
                     price = float(row.get("цена", 0))
                     cost = float(row.get("себестоимость", 0))
                     l = float(row.get("д", 0))
                     w = float(row.get("ш", 0))
                     h = float(row.get("в", 0))
                     weight = float(row.get("вес", 0))
-                    
+
                     comm_rate, comm_level, comm_key = find_commission(name, openai_key)
                     logistics, logistics_type = calculate_logistics(l, w, h, weight)
                     ref_fee = price * comm_rate
                     acq_cost = price * (acquiring / 100)
                     early_cost = price * (early_payout / 100)
                     tax_cost = calculate_tax(price, cost, logistics, ref_fee, acq_cost, early_cost, tax_system)
-                    
+
                     profit = price - (cost + ref_fee + logistics + acq_cost + early_cost + tax_cost)
                     margin = (profit / price) * 100 if price > 0 else 0
                     rec_price = find_target_price(
-                        cost, logistics, comm_rate,
-                        acquiring, early_payout,
-                        tax_system, target_margin
+                        cost,
+                        logistics,
+                        comm_rate,
+                        acquiring,
+                        early_payout,
+                        tax_system,
+                        target_margin,
                     )
-                    
-                    results.append({
+
+                    result_row = {
                         "Артикул": sku,
                         "Наименование": name,
+                        "Себестоимость": round(cost, 2),
                         "Категория": comm_key,
                         "Уровень": comm_level,
                         "Комиссия %": round(comm_rate * 100, 1),
-                        "Тек. Цена": price,
+                        "Тек. Цена": round(price, 2),
                         "Логистика": round(logistics, 2),
                         "Тип логистики": logistics_type,
                         "Маржа %": round(margin, 2),
                         "Прибыль": round(profit, 2),
                         "Цель Маржа %": target_margin,
-                        "Рек. Цена": round(rec_price, 0)
-                    })
+                        "Рек. Цена": round(rec_price, 0),
+                        "Остаток": 0,
+                    }
+                    results.append(result_row)
+                    save_calculation_to_db(result_row)
+
                 except Exception as e:
                     st.error(f"Ошибка в строке {index}: {e}")
-            status.update(label="✅ Готово!", state="complete")
-        
+
+            status.update(label="✅ Готово! Данные сохранены в «Все товары»", state="complete")
+
         if results:
             res_df = pd.DataFrame(results)
             margin_min, margin_max = get_progress_bounds(res_df["Маржа %"])
@@ -399,112 +521,79 @@ with tab1:
                         min_value=margin_min,
                         max_value=margin_max,
                     )
-                }
+                },
             )
+
             csv = res_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 Скачать результат", csv, "results.csv", "text/csv")
+            st.download_button("📥 Скачать результат CSV", csv, "results.csv", "text/csv")
         else:
             st.warning("Нет данных для отображения.")
     else:
         st.info("Загрузите файл Excel через боковую панель для начала расчёта.")
         st.table(template_df)
 
+
 # ══════════════════════════════════════════════════════════════
-# TAB 2: Добавить товар вручную
+# TAB 2: ALL PRODUCTS (memory by SKU + export)
 # ══════════════════════════════════════════════════════════════
 with tab2:
-    with st.form("add_product"):
-        name_input = st.text_input("Название товара")
-        cost_input = st.number_input("Себестоимость (₽)", min_value=0.0, step=100.0)
-        price_input = st.number_input("Цена продажи (₽)", min_value=0.0, step=100.0)
-        stock_input = st.number_input("Остаток на складе (шт)", min_value=0, step=1, value=0)
-        submitted = st.form_submit_button("Добавить")
-        
-        if submitted and name_input and cost_input > 0 and price_input > 0:
-            rate, level, key = find_commission(name_input, openai_key)
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO products 
-                (name, cost, price, stock, commission_rate, commission_level, commission_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (name_input, cost_input, price_input, stock_input, rate, level, key))
-            conn.commit()
-            st.success(
-                f"✅ Товар добавлен! Комиссия {rate*100:.1f}% — "
-                f"найдена по уровню «{level}» → {key}"
-            )
-            st.rerun()
+    df_products = pd.read_sql_query(
+        """
+        SELECT
+            id,
+            sku AS "Артикул",
+            name AS "Наименование",
+            cost AS "Себестоимость",
+            price AS "Тек. Цена",
+            logistics AS "Логистика",
+            logistics_type AS "Тип логистики",
+            ROUND(commission_rate * 100, 1) AS "Комиссия %",
+            commission_level AS "Уровень",
+            commission_key AS "Категория",
+            margin AS "Маржа %",
+            profit AS "Прибыль",
+            target_margin AS "Цель Маржа %",
+            rec_price AS "Рек. Цена",
+            updated_at AS "Обновлено"
+        FROM products
+        ORDER BY id DESC
+    """,
+        conn,
+    )
 
-# ══════════════════════════════════════════════════════════════
-# TAB 3: Все товары
-# ══════════════════════════════════════════════════════════════
-with tab3:
-    df_products = pd.read_sql_query("SELECT * FROM products", conn)
     if df_products.empty:
-        st.info("Товаров пока нет")
+        st.info("Товаров пока нет. Загрузите Excel в первой вкладке.")
     else:
-        df_products["Комиссия М.Видео"] = (df_products["price"] * df_products["commission_rate"]).round(2)
-        df_products["Выплата от М.Видео"] = (df_products["price"] - df_products["Комиссия М.Видео"]).round(2)
-        df_products["Маржа"] = (df_products["Выплата от М.Видео"] - df_products["cost"]).round(2)
-        df_products["ROI (%)"] = ((df_products["Маржа"] / df_products["cost"]) * 100).round(1)
-        
-        margin_min, margin_max = get_progress_bounds(df_products["Маржа"])
-        roi_min, roi_max = get_progress_bounds(df_products["ROI (%)"])
-        
+        margin_min, margin_max = get_progress_bounds(df_products["Маржа %"])
         st.dataframe(
-            df_products[[
-                "id", "name", "cost", "price", "stock", 
-                "commission_rate", "commission_level", "commission_key",
-                "Комиссия М.Видео", "Выплата от М.Видео", "Маржа", "ROI (%)"
-            ]],
+            df_products,
             use_container_width=True,
             column_config={
-                "Маржа": st.column_config.ProgressColumn(
-                    "Маржа (₽)",
-                    format="%.2f ₽",
+                "Маржа %": st.column_config.ProgressColumn(
+                    "Маржа %",
+                    format="%.2f%%",
                     min_value=margin_min,
                     max_value=margin_max,
-                ),
-                "ROI (%)": st.column_config.ProgressColumn(
-                    "ROI (%)",
-                    format="%.1f%%",
-                    min_value=roi_min,
-                    max_value=roi_max,
                 )
-            }
+            },
         )
-        
-        st.markdown("---")
-        del_id = st.number_input("ID товара для удаления", min_value=0, step=1, value=0)
-        if st.button("🗑️ Удалить товар") and del_id > 0:
-            c = conn.cursor()
-            c.execute("DELETE FROM products WHERE id = ?", (del_id,))
-            conn.commit()
-            st.success(f"Товар с ID {del_id} удалён.")
-            st.rerun()
 
-# ══════════════════════════════════════════════════════════════
-# TAB 4: Аналитика
-# ══════════════════════════════════════════════════════════════
-with tab4:
-    df_analytics = pd.read_sql_query("SELECT * FROM products", conn)
-    if df_analytics.empty:
-        st.info("Нет данных для аналитики. Добавьте товары.")
-    else:
-        df_analytics["Комиссия М.Видео"] = (df_analytics["price"] * df_analytics["commission_rate"]).round(2)
-        df_analytics["Выплата от М.Видео"] = (df_analytics["price"] - df_analytics["Комиссия М.Видео"]).round(2)
-        df_analytics["Маржа"] = (df_analytics["Выплата от М.Видео"] - df_analytics["cost"]).round(2)
-        df_analytics["ROI (%)"] = ((df_analytics["Маржа"] / df_analytics["cost"]) * 100).round(1)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Товаров", len(df_analytics))
-        col2.metric("Сред. маржа (%)", f"{(df_analytics['Маржа'] / df_analytics['price'] * 100).mean():.1f}%")
-        col3.metric("Сред. ROI (%)", f"{df_analytics['ROI (%)'].mean():.1f}%")
-        col4.metric("Общая прибыль (₽)", f"{(df_analytics['Маржа'] * df_analytics['stock']).sum():,.0f} ₽")
-        
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df_products.to_excel(writer, index=False, sheet_name="products")
+
+        st.download_button(
+            "📥 Скачать все товары (Excel)",
+            out.getvalue(),
+            "all_products.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
         st.markdown("---")
-        st.subheader("📊 Маржа по товарам")
-        st.bar_chart(df_analytics.set_index("name")["Маржа"])
-        
-        st.subheader("📈 ROI по товарам")
-        st.bar_chart(df_analytics.set_index("name")["ROI (%)"])
+        del_sku = st.text_input("Удалить товар по артикулу (SKU)")
+        if st.button("🗑️ Удалить товар") and del_sku.strip():
+            c = conn.cursor()
+            c.execute("DELETE FROM products WHERE sku = ?", (del_sku.strip(),))
+            conn.commit()
+            st.success(f"Товар с артикулом {del_sku.strip()} удалён.")
+            st.rerun()
