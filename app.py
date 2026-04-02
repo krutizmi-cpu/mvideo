@@ -2,17 +2,94 @@ import io
 import json
 import re
 import sqlite3
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
+from st_supabase_connection import SupabaseConnection
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="M.Video Economics", layout="wide")
 DEFAULT_COMMISSION_RATE = 0.20
+SERVICE_NAME = "mvideo"
+
+
+# ══════════════════════════════════════════════════════════════
+# ACCESS CONTROL (SUPABASE)
+# ══════════════════════════════════════════════════════════════
+@st.cache_resource
+def get_supabase():
+    return st.connection(
+        "supabase",
+        type=SupabaseConnection,
+        url=st.secrets["SUPABASE_URL"],
+        key=st.secrets["SUPABASE_KEY"],
+    )
+
+
+def check_access(email: str) -> tuple[bool, Optional[dict]]:
+    try:
+        supabase = get_supabase()
+        response = (
+            supabase.table("subscriptions")
+            .select("*")
+            .eq("email", email.strip().lower())
+            .eq("service_name", SERVICE_NAME)
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+            return False, None
+
+        row = response.data[0]
+        valid_until = row.get("valid_until")
+
+        if not valid_until:
+            return False, row
+
+        valid_until_dt = datetime.fromisoformat(valid_until.replace("Z", "+00:00"))
+        now_dt = datetime.now(valid_until_dt.tzinfo) if valid_until_dt.tzinfo else datetime.now()
+
+        return valid_until_dt > now_dt, row
+
+    except Exception as e:
+        st.error("Ошибка при проверке доступа в Supabase")
+        st.code(str(e))
+        return False, None
+
+
+def access_gate():
+    st.title("🔐 Доступ к сервису M.Video")
+    st.write("Введите email, на который оформлен доступ.")
+
+    email = st.text_input("Email", placeholder="you@example.com").strip().lower()
+
+    if not email:
+        st.info("Введите email для проверки доступа.")
+        st.stop()
+
+    is_active, row = check_access(email)
+
+    if not row:
+        st.warning("Для этого email доступ к сервису М.Видео не найден.")
+        st.stop()
+
+    valid_until = row.get("valid_until")
+    st.caption(f"Оплачено до: {valid_until}")
+
+    if not is_active:
+        st.error("Срок доступа истёк или доступ ещё не активирован.")
+        st.stop()
+
+    st.success("Доступ подтверждён")
+
+
+access_gate()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -132,14 +209,12 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-
 def token_overlap_score(left: str, right: str) -> float:
     left_tokens = set(normalize_text(left).split())
     right_tokens = set(normalize_text(right).split())
     if not left_tokens or not right_tokens:
         return 0.0
     return len(left_tokens & right_tokens) / max(len(right_tokens), 1)
-
 
 
 def get_openai_api_key(manual_key: str = "") -> str:
@@ -149,7 +224,6 @@ def get_openai_api_key(manual_key: str = "") -> str:
         return str(st.secrets.get("OPENAI_API_KEY", "")).strip()
     except Exception:
         return ""
-
 
 
 def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
@@ -168,10 +242,8 @@ def get_progress_bounds(series: pd.Series) -> tuple[float, float]:
     return min_value, max_value
 
 
-
 def format_optional_price(value: Optional[float]) -> Optional[float]:
     return None if value is None else round(value, 0)
-
 
 
 def normalize_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -212,7 +284,6 @@ def normalize_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
 def find_row_by_category_name(category_name: str):
     category_name_norm = normalize_text(category_name)
     if not category_name_norm:
@@ -223,7 +294,6 @@ def find_row_by_category_name(category_name: str):
             if normalize_text(row[key]) == category_name_norm:
                 return row, key, row[key]
     return None
-
 
 
 def is_accessory_bike_mismatch(product_name: str, category_name: str) -> bool:
@@ -247,7 +317,6 @@ def is_accessory_bike_mismatch(product_name: str, category_name: str) -> bool:
         return True
 
     return False
-
 
 
 def ai_match_category(name: str, api_key: str):
@@ -282,7 +351,6 @@ def ai_match_category(name: str, api_key: str):
         return selected
     except Exception:
         return None
-
 
 
 def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
@@ -351,20 +419,6 @@ def find_commission(name: str, openai_key: str = "") -> tuple[float, str, str]:
 # CALCULATIONS
 # ══════════════════════════════════════════════════════════════
 def calculate_logistics(l, w, h, weight):
-    """
-    Габариты приходят в сантиметрах.
-
-    Тарифы:
-    - S: 110 ₽
-    - M: 190 ₽
-    - L/XL: 1290 ₽
-
-    Логика классов:
-    - XL: любая сторона > 120 см
-    - L: объем > 0.2 м3 или > 200 л или вес > 15 кг
-    - M: объем >= 0.01 м3 или >= 10 л
-    - S: остальное
-    """
     l = max(float(l), 0.0)
     w = max(float(w), 0.0)
     h = max(float(h), 0.0)
@@ -383,10 +437,8 @@ def calculate_logistics(l, w, h, weight):
     return 110, "Малогабаритный (S)"
 
 
-
 def vat_part(amount: float) -> float:
     return max(0.0, amount) * 20 / 120
-
 
 
 def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
@@ -441,7 +493,6 @@ def calculate_tax(price, cost, logistics, commission, acq, early, tax_system):
     return 0.0
 
 
-
 def calculate_unit_metrics(
     price: float,
     cost: float,
@@ -483,7 +534,6 @@ def calculate_unit_metrics(
     }
 
 
-
 def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, tax_type, target_m):
     target_margin_decimal = target_m / 100
 
@@ -517,7 +567,6 @@ def find_target_price(cost, logistics, commission_rate, acq_rate, early_rate, ta
             low = mid
 
     return round(high, 2)
-
 
 
 def save_calculation_to_db(row: dict):
