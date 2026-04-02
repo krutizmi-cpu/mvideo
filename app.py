@@ -33,7 +33,10 @@ def get_supabase():
 
 def check_access(email: str) -> tuple[bool, Optional[dict]]:
     try:
+        st.write("DEBUG SUPABASE_URL:", st.secrets["SUPABASE_URL"])
+
         supabase = get_supabase()
+
         response = (
             supabase.table("subscriptions")
             .select("*")
@@ -42,6 +45,8 @@ def check_access(email: str) -> tuple[bool, Optional[dict]]:
             .limit(1)
             .execute()
         )
+
+        st.write("DEBUG RESPONSE:", response.data)
 
         if not response.data:
             return False, None
@@ -335,7 +340,7 @@ def ai_match_category(name: str, api_key: str):
         "Выбери ОДНУ лучшую категорию из списка для названия товара. "
         "Если подходящей категории нет, ответь NONE. "
         "Важно: если товар — полноценный велосипед, не выбирай категории для авто-креплений и запчастей. "
-        "Ответ строго JSON: {\"category\":\"...\"}.\n\n"
+        'Ответ строго JSON: {"category":"..."}.\n\n'
         f"Название товара: {name}\n\n"
         "Список категорий:\n"
         + "\n".join(f"- {c}" for c in categories)
