@@ -63,8 +63,7 @@ def check_access(email: str) -> tuple[bool, Optional[dict]]:
         return valid_until_dt > now_dt, row
 
     except Exception as e:
-        st.error("Ошибка при проверке доступа в Supabase")
-        st.code(str(e))
+        st.write("DEBUG ERROR:", str(e))
         return False, None
 
 
@@ -72,15 +71,16 @@ def access_gate():
     st.title("🔐 Доступ к сервису M.Video")
     st.write("Введите email, на который оформлен доступ.")
 
-    email = st.text_input("Email", placeholder="you@example.com").strip().lower()
+    email = st.text_input("Email", placeholder="you@example.com")
 
     if not email:
-        st.info("Введите email для проверки доступа.")
         st.stop()
+
+    email = email.strip().lower()
 
     is_active, row = check_access(email)
 
-    if not row:
+    if row is None:
         st.warning("Для этого email доступ к сервису М.Видео не найден.")
         st.stop()
 
