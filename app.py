@@ -33,7 +33,7 @@ def get_supabase():
 
 def check_access(email: str) -> tuple[bool, Optional[dict]]:
     try:
-        st.write("DEBUG SUPABASE_URL:", st.secrets["SUPABASE_URL"])
+        
 
         supabase = get_supabase()
 
@@ -46,7 +46,7 @@ def check_access(email: str) -> tuple[bool, Optional[dict]]:
             .execute()
         )
 
-        st.write("DEBUG RESPONSE:", response.data)
+        
 
         if not response.data:
             return False, None
@@ -63,7 +63,7 @@ def check_access(email: str) -> tuple[bool, Optional[dict]]:
         return valid_until_dt > now_dt, row
 
     except Exception as e:
-        st.write("DEBUG ERROR:", str(e))
+        
         return False, None
 
 
