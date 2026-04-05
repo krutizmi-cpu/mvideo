@@ -15,7 +15,45 @@ from st_supabase_connection import SupabaseConnection
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="M.Video Economics", layout="wide")
 DEFAULT_COMMISSION_RATE = 0.20
+
 SERVICE_NAME = "mvideo"
+SERVICE_TITLE = "M.Video"
+SERVICE_PRICE_RUB = 1000
+SERVICE_PERIOD_DAYS = 30
+
+COMPANY_NAME = "ООО «Гонецъ»"
+COMPANY_INN = "9704248886"
+COMPANY_OGRN = "1247700574450"
+COMPANY_KPP = "770401001"
+COMPANY_EMAIL = "k@kokokoko.ru"
+COMPANY_PHONE = ""
+COMPANY_ADDRESS = "119002, город Москва, Большой Николопесковский пер, д. 13, помещ. 2н"
+
+
+# ══════════════════════════════════════════════════════════════
+# COMPANY INFO
+# ══════════════════════════════════════════════════════════════
+def render_company_sidebar():
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("🏢 Реквизиты и контакты")
+        st.write(f"**{COMPANY_NAME}**")
+        st.write(f"ИНН: {COMPANY_INN}")
+        st.write(f"ОГРН: {COMPANY_OGRN}")
+        st.write(f"КПП: {COMPANY_KPP}")
+        st.write(f"Email: {COMPANY_EMAIL}")
+        st.write(f"Телефон: {COMPANY_PHONE}")
+        st.write(f"Адрес: {COMPANY_ADDRESS}")
+
+
+def render_company_footer():
+    st.markdown("---")
+    st.caption(
+        f"{COMPANY_NAME} • ИНН: {COMPANY_INN} • ОГРН: {COMPANY_OGRN} • КПП: {COMPANY_KPP}"
+    )
+    st.caption(
+        f"Контакты: {COMPANY_PHONE} • {COMPANY_EMAIL} • {COMPANY_ADDRESS}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -33,8 +71,6 @@ def get_supabase():
 
 def check_access(email: str) -> tuple[bool, Optional[dict]]:
     try:
-        
-
         supabase = get_supabase()
 
         response = (
@@ -45,8 +81,6 @@ def check_access(email: str) -> tuple[bool, Optional[dict]]:
             .limit(1)
             .execute()
         )
-
-        
 
         if not response.data:
             return False, None
@@ -63,38 +97,78 @@ def check_access(email: str) -> tuple[bool, Optional[dict]]:
         return valid_until_dt > now_dt, row
 
     except Exception as e:
-        
+        st.error("Ошибка при проверке доступа")
+        st.code(str(e))
         return False, None
+
+
+def show_payment_stub(email: str):
+    st.markdown("---")
+    st.subheader("💳 Доступ к сервису")
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.markdown(
+            f'''
+### Что вы получите
+- Массовый расчёт юнит-экономики через Excel
+- Автоматическое определение комиссии
+- Расчёт логистики
+- Расчёт полной себестоимости и прибыли
+- Рекомендованную цену под целевую маржинальность
+- Выгрузку результата в Excel
+
+### Условия доступа
+- Сервис: **{SERVICE_TITLE}**
+- Срок доступа: **{SERVICE_PERIOD_DAYS} дней**
+- Email: **{email}**
+- Доступ привязывается к email
+'''
+        )
+
+    with col2:
+        st.metric("Цена", f"{SERVICE_PRICE_RUB} ₽")
+        st.metric("Период", f"{SERVICE_PERIOD_DAYS} дней")
+
+    st.info("Оплата через ЮKassa появится сразу после завершения проверки анкеты.")
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        if st.button("💳 Оплатить доступ", use_container_width=True):
+            st.warning("ЮKassa ещё не подключена. Сейчас ждём завершения проверки анкеты.")
+
+    with col_b:
+        if st.button("✅ У меня уже есть оплата", use_container_width=True):
+            st.info("После подключения ЮKassa эта кнопка будет проверять статус платежа автоматически.")
 
 
 def access_gate():
     st.title("🔐 Доступ к сервису M.Video")
-    st.write("Введите email, на который оформлен доступ.")
+    st.write("Введите email, на который будет оформлен или уже оформлен доступ.")
 
     email = st.text_input("Email", placeholder="you@example.com")
 
     if not email:
+        render_company_footer()
         st.stop()
 
     email = email.strip().lower()
 
     is_active, row = check_access(email)
 
-    if row is None:
-        st.warning("Для этого email доступ к сервису М.Видео не найден.")
-        st.stop()
+    if row is not None:
+        valid_until = row.get("valid_until")
+        st.success(f"Подписка активна до: {valid_until}")
 
-    valid_until = row.get("valid_until")
-    st.caption(f"Оплачено до: {valid_until}")
+    if is_active:
+        return
 
-    if not is_active:
-        st.error("Срок доступа истёк или доступ ещё не активирован.")
-        st.stop()
-
-    st.success("Доступ подтверждён")
-
-
-access_gate()
+    st.warning("Активный доступ не найден.")
+    show_payment_stub(email)
+    render_company_footer()
+    st.stop()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,16 +215,16 @@ def init_db():
     c = conn.cursor()
 
     c.execute(
-        """
+        '''
         CREATE TABLE IF NOT EXISTS ai_cache (
             name TEXT PRIMARY KEY,
             category TEXT
         )
-    """
+    '''
     )
 
     c.execute(
-        """
+        '''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sku TEXT,
@@ -173,7 +247,7 @@ def init_db():
             rec_price REAL,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
-    """
+    '''
     )
 
     c.execute("PRAGMA table_info(products)")
@@ -579,7 +653,7 @@ def save_calculation_to_db(row: dict):
     sku = row["Артикул"]
 
     c.execute(
-        """
+        '''
         INSERT INTO products (
             sku, name, cost, price, stock,
             logistics, logistics_type,
@@ -607,7 +681,7 @@ def save_calculation_to_db(row: dict):
             target_margin=excluded.target_margin,
             rec_price=excluded.rec_price,
             updated_at=CURRENT_TIMESTAMP
-    """,
+    ''',
         (
             sku,
             row["Наименование"],
@@ -674,6 +748,9 @@ with st.sidebar:
     )
 
     uploaded_file = st.file_uploader("Загрузите файл Excel", type=["xlsx"])
+
+render_company_sidebar()
+access_gate()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -815,7 +892,7 @@ with tab1:
 # ══════════════════════════════════════════════════════════════
 with tab2:
     df_products = pd.read_sql_query(
-        """
+        '''
         SELECT
             id,
             sku AS "Артикул",
@@ -838,7 +915,7 @@ with tab2:
             updated_at AS "Обновлено"
         FROM products
         ORDER BY id DESC
-    """,
+    ''',
         conn,
     )
 
@@ -884,3 +961,5 @@ with tab2:
             conn.commit()
             st.success(f"Товар с артикулом {del_sku.strip()} удалён.")
             st.rerun()
+
+render_company_footer()
